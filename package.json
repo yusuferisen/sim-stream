@@ -1,0 +1,15 @@
+{
+  "name": "sim-stream",
+  "version": "1.0.0",
+  "description": "Stream iOS Simulator to a web browser with interactive input",
+  "private": true,
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}

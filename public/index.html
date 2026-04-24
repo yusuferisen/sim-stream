@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>sim-stream</title>
+<style>
+  :root {
+    --bg: #0b0b0f;
+    --panel: #17171f;
+    --panel-2: #1f1f2a;
+    --ink: #e6e6ee;
+    --muted: #8a8aa0;
+    --accent: #7aa2ff;
+    --danger: #ff6b6b;
+    --ok: #4ade80;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    overscroll-behavior: none; touch-action: none;
+  }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 12px; background: var(--panel); border-bottom: 1px solid #262633;
+    flex-shrink: 0;
+  }
+  header .title { font-weight: 600; letter-spacing: 0.2px; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  header .status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  header .dot.ok { background: var(--ok); }
+  header .dot.bad { background: var(--danger); }
+
+  main { flex: 1; display: grid; grid-template-columns: 1fr auto; min-height: 0; }
+  #stage { position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #06060a; }
+  #screen-wrap {
+    position: relative;
+    max-height: 100%;
+    max-width: 100%;
+    /* Server templates the real aspect in here on each page render. */
+    aspect-ratio: __ASPECT__;
+    height: 100%;
+    display: flex;
+  }
+  #screen {
+    width: 100%; height: 100%;
+    display: block;
+    object-fit: contain;
+    background: #000;
+    user-select: none;
+    -webkit-user-drag: none;
+    pointer-events: none;
+  }
+  #overlay {
+    position: absolute; inset: 0;
+    cursor: crosshair;
+    touch-action: none;
+  }
+  .touch-dot {
+    position: absolute; width: 24px; height: 24px; margin: -12px 0 0 -12px;
+    border-radius: 50%;
+    background: rgba(122,162,255,0.35);
+    border: 2px solid rgba(122,162,255,0.9);
+    pointer-events: none;
+    animation: pulse 400ms ease-out forwards;
+  }
+  @keyframes pulse {
+    from { transform: scale(0.5); opacity: 1; }
+    to { transform: scale(1.6); opacity: 0; }
+  }
+
+  aside {
+    width: 240px;
+    background: var(--panel);
+    border-left: 1px solid #262633;
+    padding: 12px;
+    display: flex; flex-direction: column; gap: 10px;
+    overflow: auto;
+  }
+  .group { display: flex; flex-direction: column; gap: 6px; }
+  .group h3 { margin: 0; font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: 1px; }
+  button, .btn {
+    appearance: none; border: 1px solid #2e2e3f;
+    background: var(--panel-2); color: var(--ink);
+    padding: 8px 10px; border-radius: 8px;
+    cursor: pointer; font: inherit; text-align: left;
+    transition: background 120ms, border-color 120ms;
+  }
+  button:hover { background: #2a2a38; border-color: #3a3a4f; }
+  button:active { background: #32324a; }
+  button.primary { background: var(--accent); color: #0b0b0f; border-color: transparent; font-weight: 600; }
+  .row { display: flex; gap: 6px; }
+  .row > * { flex: 1; }
+  textarea, input[type="text"] {
+    background: #0d0d14; color: var(--ink);
+    border: 1px solid #262633; border-radius: 6px; padding: 6px 8px;
+    font: inherit; resize: vertical;
+  }
+  textarea { min-height: 48px; }
+  .hint { color: var(--muted); font-size: 11px; }
+  kbd {
+    font-family: ui-monospace, "SF Mono", monospace;
+    background: #2a2a38; border-radius: 4px; padding: 1px 5px; font-size: 11px;
+  }
+
+  @media (max-width: 720px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+    aside { width: auto; border-left: none; border-top: 1px solid #262633; max-height: 40vh; }
+    header .meta { display: none; }
+  }
+
+  #toast {
+    position: fixed; bottom: 16px; left: 50%; transform: translate(-50%, 16px);
+    background: #1f1f2a; color: var(--ink);
+    padding: 8px 14px; border-radius: 8px;
+    border: 1px solid #2e2e3f;
+    font-size: 13px; max-width: 80vw;
+    opacity: 0; pointer-events: none;
+    transition: opacity 160ms ease, transform 160ms ease;
+    z-index: 999;
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  #toast.bad { border-color: #ff6b6b; color: #ff8a8a; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="title">sim-stream</div>
+    <div class="meta" id="meta">—</div>
+    <div class="spacer"></div>
+    <div class="status"><span class="dot" id="stream-dot"></span> stream</div>
+    <div class="status"><span class="dot" id="ws-dot"></span> input</div>
+  </header>
+  <main>
+    <div id="stage">
+      <div id="screen-wrap">
+        <img id="screen" alt="simulator" draggable="false" />
+        <div id="overlay"></div>
+      </div>
+    </div>
+    <aside>
+      <div class="group">
+        <h3>Hardware</h3>
+        <button data-btn="home">Home</button>
+        <button data-btn="lock">Lock</button>
+        <button data-btn="siri">Siri</button>
+        <button data-btn="screenshot">Screenshot</button>
+      </div>
+      <div class="group">
+        <h3>Keyboard</h3>
+        <div class="hint">Focus this panel and type. <kbd>Enter</kbd>=Return, <kbd>⌫</kbd>=Backspace.</div>
+        <input type="text" id="kbd" placeholder="click here then type" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+        <div class="row">
+          <button data-key="return">↵ Return</button>
+          <button data-key="backspace">⌫ Back</button>
+        </div>
+        <div class="row">
+          <button data-key="space">Space</button>
+          <button data-key="tab">Tab</button>
+        </div>
+      </div>
+      <div class="group">
+        <h3>Paste Text</h3>
+        <textarea id="paste-text" placeholder="type here and click Send"></textarea>
+        <button id="send-text" class="primary">Send to simulator</button>
+      </div>
+      <div class="group">
+        <h3>Gestures</h3>
+        <div class="row">
+          <button data-swipe="up">▲ Scroll</button>
+          <button data-swipe="down">▼ Scroll</button>
+        </div>
+        <div class="row">
+          <button data-swipe="left">← Swipe</button>
+          <button data-swipe="right">→ Swipe</button>
+        </div>
+      </div>
+      <div class="group">
+        <h3>About</h3>
+        <div class="hint" id="sim-info">—</div>
+      </div>
+    </aside>
+  </main>
+  <div id="toast" aria-live="polite"></div>
+</div>
+
+<script>
+(() => {
+  const qs = new URLSearchParams(location.search);
+  const token = qs.get("token") || "";
+  const authParam = token ? `?token=${encodeURIComponent(token)}` : "";
+
+  const $ = (id) => document.getElementById(id);
+  const screen = $("screen");
+  const overlay = $("overlay");
+  const streamDot = $("stream-dot");
+  const wsDot = $("ws-dot");
+  const metaLabel = $("meta");
+  const simInfo = $("sim-info");
+  const toastEl = $("toast");
+
+  // Bounds are used client-side only for normalizing pointer coordinates.
+  // The server has its own authoritative copy and ignores anything we send.
+  let bounds = { w: 393, h: 852 };
+  let ws = null;
+  let wsReady = false;
+  let reqId = 1;
+  const pendingAcks = new Map(); // reqId → { onAck, onError }
+
+  // -----------------------------------------------------------------------
+  // Toast
+  // -----------------------------------------------------------------------
+  let toastTimer = null;
+  function toast(message, kind = "ok") {
+    clearTimeout(toastTimer);
+    toastEl.textContent = message;
+    toastEl.classList.toggle("bad", kind === "bad");
+    toastEl.classList.add("show");
+    toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2500);
+  }
+
+  // -----------------------------------------------------------------------
+  // Load simulator info from server, THEN start the stream. This avoids an
+  // aspect-ratio flash because the server also inlines the real aspect into
+  // the page template — but we still defer setting src so the img doesn't
+  // begin before we know the device info.
+  // -----------------------------------------------------------------------
+  fetch(`/api/info${authParam}`).then((r) => r.json()).then((info) => {
+    const sim = info.simulator || {};
+    metaLabel.textContent = `${sim.name || "?"} • ${sim.runtime || ""}`;
+    simInfo.textContent = `${sim.name}\n${sim.runtime}\nudid: ${sim.udid?.slice(0, 8)}…`;
+    if (info.bounds && info.bounds.w) bounds = info.bounds;
+    screen.src = `/stream${authParam}`;
+  }).catch((e) => {
+    console.error(e);
+    toast("Could not load simulator info — check auth token", "bad");
+  });
+
+  screen.onload = () => { streamDot.classList.add("ok"); streamDot.classList.remove("bad"); };
+  screen.onerror = () => { streamDot.classList.remove("ok"); streamDot.classList.add("bad"); };
+
+  // -----------------------------------------------------------------------
+  // WebSocket input (with exponential-backoff reconnect)
+  // -----------------------------------------------------------------------
+  let wsBackoffMs = 1500;
+  const WS_BACKOFF_MAX = 30_000;
+  function connectWs() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${proto}//${location.host}/ws${authParam}`);
+    ws.onopen = () => {
+      wsReady = true;
+      wsBackoffMs = 1500;
+      wsDot.classList.add("ok"); wsDot.classList.remove("bad");
+    };
+    ws.onclose = (e) => {
+      wsReady = false;
+      wsDot.classList.remove("ok"); wsDot.classList.add("bad");
+      // 1008 and 1006 for close-before-open on auth fail; surface once.
+      if (e && (e.code === 1006 || e.code === 1008) && wsBackoffMs === 1500) {
+        toast("Input connection failed — check auth token", "bad");
+      }
+      setTimeout(connectWs, wsBackoffMs);
+      wsBackoffMs = Math.min(WS_BACKOFF_MAX, wsBackoffMs * 2);
+    };
+    ws.onerror = () => { wsDot.classList.add("bad"); };
+    ws.onmessage = (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      if (msg.type === "hello") {
+        if (msg.bounds && msg.bounds.w) bounds = msg.bounds;
+        applyStreamStatus(msg.stream);
+      } else if (msg.type === "stream") {
+        applyStreamStatus(msg.status);
+      } else if (msg.type === "ack") {
+        const cb = pendingAcks.get(msg.id);
+        if (cb) { pendingAcks.delete(msg.id); cb.onAck?.(msg); }
+      } else if (msg.type === "error") {
+        const cb = pendingAcks.get(msg.id);
+        if (cb) { pendingAcks.delete(msg.id); cb.onError?.(msg); }
+        else console.warn("[input]", msg.message);
+      }
+    };
+  }
+  connectWs();
+
+  function applyStreamStatus(status) {
+    if (status === "live" || status === "idle") {
+      streamDot.classList.add("ok"); streamDot.classList.remove("bad");
+    } else if (status === "dead") {
+      streamDot.classList.remove("ok"); streamDot.classList.add("bad");
+      // Kick the img to force a reconnect: server will respawn AXe.
+      if (screen.src) screen.src = `/stream${authParam}&_r=${Date.now()}`;
+    }
+  }
+
+  function send(evt, { onAck, onError } = {}) {
+    if (!wsReady) return;
+    const id = reqId++;
+    evt.id = id;
+    if (onAck || onError) pendingAcks.set(id, { onAck, onError });
+    ws.send(JSON.stringify(evt));
+  }
+
+  // -----------------------------------------------------------------------
+  // Touch / pointer handling on overlay
+  // -----------------------------------------------------------------------
+  const TAP_MAX_MOVE = 8;      // px
+  const LONG_PRESS_MS = 500;   // ms
+  let pointer = null;
+
+  function normalize(e) {
+    const rect = overlay.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+    return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)), rect };
+  }
+
+  overlay.addEventListener("pointerdown", (e) => {
+    overlay.setPointerCapture(e.pointerId);
+    const n = normalize(e);
+    pointer = {
+      id: e.pointerId,
+      startX: n.x, startY: n.y, curX: n.x, curY: n.y,
+      startT: performance.now(),
+      moved: false,
+      rect: n.rect,
+      longPressTimer: setTimeout(() => {
+        if (pointer && !pointer.moved) {
+          pointer.isLongPress = true;
+          flashDot(pointer.startX * pointer.rect.width, pointer.startY * pointer.rect.height);
+          send({ type: "long-press", x: pointer.startX, y: pointer.startY, duration: 800 });
+        }
+      }, LONG_PRESS_MS),
+    };
+  });
+
+  overlay.addEventListener("pointermove", (e) => {
+    if (!pointer || e.pointerId !== pointer.id) return;
+    const n = normalize(e);
+    const dx = (n.x - pointer.startX) * pointer.rect.width;
+    const dy = (n.y - pointer.startY) * pointer.rect.height;
+    pointer.curX = n.x; pointer.curY = n.y;
+    if (Math.hypot(dx, dy) > TAP_MAX_MOVE) pointer.moved = true;
+  });
+
+  overlay.addEventListener("pointerup", (e) => {
+    if (!pointer || e.pointerId !== pointer.id) return;
+    clearTimeout(pointer.longPressTimer);
+    const dur = performance.now() - pointer.startT;
+    if (pointer.isLongPress) {
+      // already sent
+    } else if (!pointer.moved) {
+      flashDot(pointer.startX * pointer.rect.width, pointer.startY * pointer.rect.height);
+      send({ type: "tap", x: pointer.startX, y: pointer.startY });
+    } else {
+      send({ type: "swipe", fromX: pointer.startX, fromY: pointer.startY, toX: pointer.curX, toY: pointer.curY, duration: Math.max(150, Math.min(800, dur)) });
+    }
+    pointer = null;
+  });
+
+  overlay.addEventListener("pointercancel", () => {
+    if (pointer) clearTimeout(pointer.longPressTimer);
+    pointer = null;
+  });
+
+  function flashDot(px, py) {
+    const d = document.createElement("div");
+    d.className = "touch-dot";
+    d.style.left = px + "px";
+    d.style.top = py + "px";
+    overlay.appendChild(d);
+    setTimeout(() => d.remove(), 400);
+  }
+
+  // -----------------------------------------------------------------------
+  // Hardware buttons
+  // -----------------------------------------------------------------------
+  document.querySelectorAll("[data-btn]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const name = b.dataset.btn;
+      if (name === "screenshot") {
+        toast("Saving screenshot…");
+        send({ type: "button", name }, {
+          onAck: (m) => toast(m.detail ? `Screenshot ${m.detail}` : "Screenshot saved"),
+          onError: (m) => toast(`Screenshot failed: ${m.message}`, "bad"),
+        });
+      } else {
+        send({ type: "button", name });
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Quick-gesture buttons: preset swipes anchored near the center of screen.
+  // -----------------------------------------------------------------------
+  const SWIPES = {
+    up:    { from: [0.5, 0.75], to: [0.5, 0.25] },
+    down:  { from: [0.5, 0.25], to: [0.5, 0.75] },
+    left:  { from: [0.8, 0.5],  to: [0.2, 0.5]  },
+    right: { from: [0.2, 0.5],  to: [0.8, 0.5]  },
+  };
+  document.querySelectorAll("[data-swipe]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const cfg = SWIPES[b.dataset.swipe];
+      if (!cfg) return;
+      send({
+        type: "swipe",
+        fromX: cfg.from[0], fromY: cfg.from[1],
+        toX:   cfg.to[0],   toY:   cfg.to[1],
+        duration: 250,
+      });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Keyboard. keydown works on desktop; mobile soft keyboards only fire
+  // `input` reliably, so we handle both paths.
+  // -----------------------------------------------------------------------
+  const kbd = $("kbd");
+  const KEY_MAP = {
+    Enter: "return", Backspace: "backspace", Tab: "tab", Escape: "escape",
+    ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
+  };
+  kbd.addEventListener("keydown", (e) => {
+    const mapped = KEY_MAP[e.key];
+    if (mapped) { send({ type: "key", key: mapped }); e.preventDefault(); return; }
+    // Single printable char: desktop path
+    if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      send({ type: "type", text: e.key });
+      e.preventDefault();
+    }
+  });
+  kbd.addEventListener("input", (e) => {
+    // Mobile soft-keyboard path. On desktop this also runs, but the keydown
+    // handler has already sent+preventDefault'd, so kbd.value stays empty.
+    if (e.inputType === "deleteContentBackward") {
+      send({ type: "key", key: "backspace" });
+    } else if (kbd.value) {
+      send({ type: "type", text: kbd.value });
+    }
+    kbd.value = "";
+  });
+
+  document.querySelectorAll("[data-key]").forEach((b) => {
+    b.addEventListener("click", () => send({ type: "key", key: b.dataset.key }));
+  });
+
+  $("send-text").addEventListener("click", () => {
+    const t = $("paste-text").value;
+    if (t) send({ type: "type", text: t });
+  });
+
+  // Auto-focus the keyboard input for mouse users only. On touch devices
+  // this would pop up the on-screen keyboard every time you tap the sim.
+  overlay.addEventListener("pointerup", (e) => {
+    if (e.pointerType === "mouse") kbd.focus();
+  }, true);
+})();
+</script>
+</body>
+</html>
