@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no, interactive-widget=resizes-content" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <title>sim-stream</title>
 <style>
@@ -107,10 +107,123 @@
     background: #2a2a38; border-radius: 4px; padding: 1px 5px; font-size: 11px;
   }
 
+  /* Mobile-only sheet/FAB elements hidden on desktop */
+  #fab, #sheet-backdrop { display: none; }
+  aside > #sheet-handle { display: none; }
+
   @media (max-width: 720px) {
-    main { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
-    aside { width: auto; border-left: none; border-top: 1px solid #262633; max-height: 40vh; }
-    header .meta { display: none; }
+    #app { height: 100dvh; }
+
+    header { padding: 4px 8px; padding-top: max(4px, env(safe-area-inset-top)); }
+    header .title, header .meta { display: none; }
+
+    main { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+    #stage {
+      padding-left: env(safe-area-inset-left);
+      padding-right: env(safe-area-inset-right);
+    }
+
+    /* aside becomes a bottom sheet */
+    aside {
+      position: fixed;
+      left: 0; right: 0; bottom: var(--kb-offset, 0px);
+      width: auto;
+      /* Subtract --kb-offset so the sheet shrinks above the soft keyboard
+         instead of pushing the drag handle off the top of the viewport. */
+      max-height: calc(85dvh - var(--kb-offset, 0px));
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      border: none;
+      border-radius: 16px 16px 0 0;
+      box-shadow: 0 -8px 24px rgba(0,0,0,0.5);
+      padding: 0 16px calc(16px + env(safe-area-inset-bottom)) 16px;
+      gap: 14px;
+      transform: translateY(100%);
+      transition: transform 260ms cubic-bezier(0.32, 0.72, 0, 1);
+      touch-action: pan-y;
+      z-index: 60;
+    }
+    #app.sheet-open aside { transform: translateY(0); }
+
+    aside > #sheet-handle {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      width: 100%;
+      height: 40px;
+      margin: 0;
+      flex-shrink: 0;
+      touch-action: none;
+      cursor: grab;
+    }
+    aside > #sheet-handle::before {
+      content: "";
+      display: block;
+      width: 40px; height: 5px;
+      border-radius: 3px;
+      background: #3a3a4f;
+    }
+
+    #sheet-backdrop {
+      display: block;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.4);
+      opacity: 0; pointer-events: none;
+      transition: opacity 260ms;
+      z-index: 55;
+    }
+    #app.sheet-open #sheet-backdrop { opacity: 1; pointer-events: auto; }
+
+    #fab {
+      display: flex;
+      align-items: center; justify-content: center;
+      position: fixed;
+      right: calc(16px + env(safe-area-inset-right));
+      bottom: calc(16px + env(safe-area-inset-bottom));
+      width: 56px; height: 56px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: var(--bg);
+      border: none;
+      padding: 0;
+      font-size: 28px; font-weight: 700; line-height: 1;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      z-index: 50;
+      transition: transform 200ms ease, opacity 200ms ease;
+    }
+    #app.sheet-open #fab {
+      opacity: 0;
+      transform: scale(0.8);
+      pointer-events: none;
+    }
+
+    /* Touch-target sizing */
+    button, .btn {
+      padding: 12px 14px;
+      min-height: 44px;
+      font-size: 15px;
+    }
+    input[type="text"], textarea {
+      padding: 10px 12px;
+      min-height: 44px;
+      font-size: 16px;
+    }
+    textarea { min-height: 72px; }
+    .group { gap: 8px; }
+    .group h3 { font-size: 12px; }
+    .row { gap: 8px; }
+
+    #toast { bottom: calc(16px + env(safe-area-inset-bottom)); }
+  }
+
+  /* Landscape: constrain sheet to right half so stream stays visible */
+  @media (max-width: 720px) and (orientation: landscape) {
+    aside {
+      left: auto; right: 0;
+      max-width: 480px;
+      max-height: calc(75dvh - var(--kb-offset, 0px));
+      border-radius: 16px 0 0 16px;
+    }
   }
 
   #toast {
@@ -144,6 +257,7 @@
       </div>
     </div>
     <aside>
+      <div id="sheet-handle" aria-hidden="true"></div>
       <div class="group">
         <h3>Hardware</h3>
         <button data-btn="home">Home</button>
@@ -187,6 +301,8 @@
     </aside>
   </main>
   <div id="toast" aria-live="polite"></div>
+  <div id="sheet-backdrop"></div>
+  <button id="fab" type="button" aria-label="Open controls" aria-expanded="false">⋯</button>
 </div>
 
 <script>
@@ -460,6 +576,88 @@
   overlay.addEventListener("pointerup", (e) => {
     if (e.pointerType === "mouse") kbd.focus();
   }, true);
+
+  // -----------------------------------------------------------------------
+  // Bottom sheet (mobile). FAB opens it; backdrop/Escape/drag-down close it.
+  // On desktop the media query hides #fab and #sheet-backdrop so this code
+  // is dormant.
+  // -----------------------------------------------------------------------
+  const app = $("app");
+  const fab = $("fab");
+  const backdrop = $("sheet-backdrop");
+  const handle = $("sheet-handle");
+  const sheet = document.querySelector("aside");
+
+  function openSheet() {
+    app.classList.add("sheet-open");
+    fab.setAttribute("aria-expanded", "true");
+  }
+  function closeSheet() {
+    app.classList.remove("sheet-open");
+    fab.setAttribute("aria-expanded", "false");
+    // Blur any focused input inside the sheet so the soft keyboard dismisses.
+    if (sheet.contains(document.activeElement)) document.activeElement.blur();
+    // Clear any inline drag state.
+    sheet.style.transform = "";
+    sheet.style.transition = "";
+  }
+
+  fab.addEventListener("click", openSheet);
+  backdrop.addEventListener("click", closeSheet);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && app.classList.contains("sheet-open")) closeSheet();
+  });
+
+  // Drag-to-dismiss on the handle.
+  let drag = null;
+  handle.addEventListener("pointerdown", (e) => {
+    if (!app.classList.contains("sheet-open")) return;
+    handle.setPointerCapture(e.pointerId);
+    sheet.style.transition = "none";
+    drag = { id: e.pointerId, startY: e.clientY, startT: performance.now() };
+  });
+  handle.addEventListener("pointermove", (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const dy = Math.max(0, e.clientY - drag.startY);
+    sheet.style.transform = `translateY(${dy}px)`;
+  });
+  handle.addEventListener("pointerup", (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const dy = Math.max(0, e.clientY - drag.startY);
+    const dt = performance.now() - drag.startT;
+    sheet.style.transition = "";
+    sheet.style.transform = "";
+    if (dy > 80 || (dy > 40 && dt < 250)) closeSheet();
+    drag = null;
+  });
+  handle.addEventListener("pointercancel", () => {
+    if (!drag) return;
+    sheet.style.transition = "";
+    sheet.style.transform = "";
+    drag = null;
+  });
+
+  // Auto-close the sheet after discrete actions. Keyboard quick-keys are
+  // intentionally excluded so users can chain Return/Back/Space/Tab.
+  function autoClose() { if (app.classList.contains("sheet-open")) closeSheet(); }
+  document.querySelectorAll("[data-btn]").forEach((b) => b.addEventListener("click", autoClose));
+  document.querySelectorAll("[data-swipe]").forEach((b) => b.addEventListener("click", autoClose));
+  $("send-text").addEventListener("click", autoClose);
+
+  // Keep the sheet visible above the soft keyboard on iOS Safari. Android
+  // Chrome gets the same effect for free via the viewport-meta
+  // `interactive-widget=resizes-content`, but the VV listener is harmless
+  // there — its computed offset will be 0.
+  if (window.visualViewport) {
+    const vv = window.visualViewport;
+    const syncKbOffset = () => {
+      const offset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+      document.documentElement.style.setProperty("--kb-offset", offset + "px");
+    };
+    vv.addEventListener("resize", syncKbOffset);
+    vv.addEventListener("scroll", syncKbOffset);
+    syncKbOffset();
+  }
 })();
 </script>
 </body>

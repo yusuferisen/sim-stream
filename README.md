@@ -87,8 +87,8 @@ Keep the token secret — it's the only thing gating access when exposed.
 - **Tap** — click/tap anywhere on the simulator view
 - **Swipe** — click-drag / touch-drag across the view
 - **Long-press** — hold for ≥500ms without moving
-- **Keyboard** — focus the text input in the sidebar, then type. `Enter`,
-  `Backspace`, `Tab`, `Esc`, arrows are recognized.
+- **Keyboard** — focus the text input in the controls panel, then type.
+  `Enter`, `Backspace`, `Tab`, `Esc`, arrows are recognized.
 - **Paste text** — use the "Paste Text" textarea to send long strings
   without keystroke-by-keystroke lag
 - **Hardware buttons** — Home, Lock, Siri
@@ -96,6 +96,12 @@ Keep the token secret — it's the only thing gating access when exposed.
   center of the screen
 - **Screenshot** — saved to `~/Desktop/sim-stream-<timestamp>.png`, with a
   toast confirmation
+
+On narrow viewports (≤720px wide), the controls panel collapses into a
+bottom sheet opened by a corner ⋯ button. Tap a backdrop or drag the
+handle down to dismiss; Hardware/Gesture/Send-text actions auto-close the
+sheet, keyboard quick-keys (Return/Back/Space/Tab) do not, so they can be
+chained.
 
 ## Configuration flags
 
