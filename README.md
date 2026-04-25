@@ -45,20 +45,24 @@ npm install
 ## Run
 
 ```sh
-./scripts/start.sh                 # auto-pick a simulator, start on :8080
-./scripts/start.sh --list          # list available simulators
-./scripts/start.sh --udid <UDID>   # pin to a specific simulator
-./scripts/start.sh --port 9090     # custom port
-./scripts/start.sh --host 0.0.0.0  # expose on LAN (default binds to 127.0.0.1)
-./scripts/start.sh --no-auth       # disable token auth (local only!)
+./scripts/start.sh                          # auto-pick a simulator, start on :8080
+./scripts/start.sh --list                   # list available simulators
+./scripts/start.sh --udid <UDID>            # pin to a specific simulator
+./scripts/start.sh --port 9090              # custom port
+./scripts/start.sh --remote lan             # expose on the LAN
+./scripts/start.sh --remote tailscale-serve # private HTTPS over your tailnet
+./scripts/start.sh --no-auth                # disable token auth (local only!)
 ```
+
+See [Remote access](#remote-access) for the full list of `--remote`
+providers (LAN, Tailscale Serve, Tailscale Funnel for public sharing).
 
 The script will boot the selected simulator if it isn't running, then start
 the web server. It prints a URL including a random auth token:
 
 ```
 sim-stream running
-  → http://127.0.0.1:8080/?token=a3f9…
+  local:     http://127.0.0.1:8080/?token=a3f9…
   token:     a3f94c...
   simulator: iPhone 17 Pro Max (3B76...)
   stream:    15fps scale=0.5 quality=75
@@ -68,19 +72,76 @@ Open the URL in any browser. You should see the live simulator screen.
 
 ### Remote access
 
-The server binds to `127.0.0.1` by default. To reach it from another device:
+The server binds to `127.0.0.1` by default. To reach it from another
+device, pass `--remote <provider>`:
 
-- **Same LAN:** `--host 0.0.0.0 --port 8080` and open
-  `http://<mac-mini-ip>:8080/?token=…` from the other device.
-- **Over the internet:** use a tunnel that gives you HTTPS without port
-  forwarding, e.g.:
-  ```sh
-  cloudflared tunnel --url http://127.0.0.1:8080
-  ```
-  Cloudflare hands you a public `trycloudflare.com` URL; append `?token=…`
-  to it and you're in.
+| `--remote …`        | Reachable from                              | URL shape                                |
+|---------------------|---------------------------------------------|------------------------------------------|
+| `lan`               | Same Wi-Fi / LAN                            | `http://<mac-ip>:8080/?token=…`          |
+| `tailscale-serve`   | Any device signed in to your tailnet        | `https://<host>.<tailnet>.ts.net/?token=…` |
+| `tailscale-funnel`  | **Anyone on the internet** with the URL     | `https://<host>.<tailnet>.ts.net/?token=…` |
+
+Examples:
+
+```sh
+./scripts/start.sh --remote lan
+./scripts/start.sh --remote tailscale-serve
+./scripts/start.sh --remote tailscale-funnel    # public — for sharing demos
+```
+
+Tailscale prerequisites (one-time, in the [admin
+console](https://login.tailscale.com/admin)):
+
+- **HTTPS Certificates** must be enabled (DNS → HTTPS Certificates).
+- **Serve** must be enabled for your tailnet. The first failed call
+  prints an admin-console URL — clicking it enables Serve in one step.
+- For `tailscale-funnel`: Funnel must also be enabled the same way, and
+  the device needs the `funnel` node attribute in your ACL (Access
+  Controls → `nodeAttrs`).
+
+On macOS, the App Store and standalone-installer Tailscale builds route
+serve/funnel through the GUI app. If you're running headless on a Mac
+Mini, `brew install tailscale` (which ships a non-sandboxed `tailscaled`)
+is more reliable for scripted use.
+
+The `lan` provider is just a convenience for `--host 0.0.0.0`. You can
+still pass `--host` directly if you need full control.
 
 Keep the token secret — it's the only thing gating access when exposed.
+For `tailscale-funnel` especially: the URL is publicly reachable; the
+token is your only auth.
+
+### Adding new remote providers
+
+`remote.js` exposes a tiny provider interface (`prepare` / `start` /
+`stop`). To add e.g. a Cloudflare quick tunnel, drop a new entry into the
+`PROVIDERS` map and it becomes selectable as `--remote <name>`. No other
+code changes.
+
+### Roadmap
+
+Future remote-access improvements worth picking up when needed:
+
+- **`cloudflared` provider** — Cloudflare Tunnel quick mode
+  (`cloudflared tunnel --url http://127.0.0.1:<port>`) as a fallback when
+  Tailscale isn't available, or when you need Cloudflare's larger
+  edge / DDoS protection. Trade-off: MJPEG can buffer through Cloudflare;
+  test before relying on it.
+- **`cloudflare-access` provider** — Named Cloudflare Tunnel on your own
+  domain, gated by Cloudflare Access (email magic link / OAuth / IP
+  rules). This is the real defense-in-depth option for durable public
+  shares: a leaked URL+token still has to clear an SSO check. Free for
+  up to 50 users.
+- **`ngrok` provider** — same shape, useful for one-off shares without a
+  Cloudflare account.
+- **Cookie-set-on-first-load token handoff** — instead of leaving the
+  token in the URL bar (where it's visible to shoulder-surfers and
+  history sync), set an httpOnly cookie on the first authenticated load
+  and strip the token from the URL. Reduces accidental leakage when
+  someone screen-shares the page.
+- **Per-share, time-limited tokens** — generate a token that expires
+  after N hours so demo links don't live forever. Useful when sharing
+  Funnel URLs with people outside your tailnet.
 
 ## Using the UI
 
@@ -118,6 +179,7 @@ All flags can be passed to `scripts/start.sh` or to `node server.js` directly:
 | `--token <str>`  | random hex  | Auth token (also accepted as `?token=…`)      |
 | `--auth false`   | on          | Disable auth (local only)                     |
 | `--no-auth`      | —           | Same as `--auth false` (start.sh shorthand)   |
+| `--remote <p>`   | —           | Remote-access provider: `lan`, `tailscale-serve`, `tailscale-funnel` |
 | `--list`         | —           | Print available simulators and exit           |
 
 Boolean flags without values (e.g. `--foo`) are treated as `"true"`. Value
@@ -152,6 +214,7 @@ at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
 | Path                      | Purpose                                                              |
 |---------------------------|----------------------------------------------------------------------|
 | `server.js`               | Node.js server: HTTP, WS, MJPEG hub, AXe command queue, auth         |
+| `remote.js`               | Pluggable remote-access providers (LAN / Tailscale Serve / Funnel)   |
 | `public/index.html`       | Single-page client: MJPEG `<img>`, pointer/gesture detection, toolbar |
 | `scripts/start.sh`        | Dev launcher: checks AXe, installs deps, boots simulator, runs server |
 
@@ -184,3 +247,15 @@ authenticate — check the token in your URL.
 
 **Stream freezes after a while** — the underlying AXe process likely
 crashed. Reload the page; the server will respawn it on the next connect.
+
+**`--remote tailscale-*` exits with "Serve/Funnel is not enabled on your
+tailnet"** — one-time setup. The error message includes a direct admin
+link (`https://login.tailscale.com/f/serve?node=…` or `…/funnel?…`);
+click it once to enable. For Funnel you also need to add the `funnel`
+node attribute in Access Controls → `nodeAttrs`.
+
+**`--remote tailscale-funnel` takes ~30s to fail then exits** — the App
+Store / standalone-installer Tailscale CLI on macOS hangs talking to its
+GUI agent in some cases. The 30s is our timeout firing; the captured
+error message is still correct. For headless / scripted use, prefer
+`brew install tailscale` (non-sandboxed `tailscaled`).

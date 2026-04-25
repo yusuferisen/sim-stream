@@ -19,13 +19,15 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { getRemoteProvider } from "./remote.js";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Flags that take a value. Anything else is treated as a boolean switch.
 // Keeping this explicit means `--token --port 9090` fails loudly instead of
 // silently treating `token` as a boolean and eating the next flag.
 const VALUE_FLAGS = new Set([
-  "port", "host", "fps", "quality", "scale", "udid", "token", "auth",
+  "port", "host", "fps", "quality", "scale", "udid", "token", "auth", "remote",
 ]);
 
 function parseArgs(argv) {
@@ -50,6 +52,7 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 const PORT = parseInt(args.port || process.env.PORT || "8080", 10);
+const HOST_EXPLICIT = args.host !== undefined || process.env.HOST !== undefined;
 const HOST = args.host || process.env.HOST || "127.0.0.1";
 const FPS = parseInt(args.fps || "15", 10);
 const QUALITY = parseInt(args.quality || "75", 10);
@@ -57,6 +60,7 @@ const SCALE = parseFloat(args.scale || "0.5");
 const REQUIRE_AUTH = args.auth !== "false";
 const TOKEN = REQUIRE_AUTH ? (args.token || randomBytes(12).toString("hex")) : null;
 const TOKEN_BUF = TOKEN ? Buffer.from(TOKEN) : null;
+const REMOTE = getRemoteProvider(args.remote || null);
 
 function tokenMatches(provided) {
   if (!TOKEN_BUF) return true;
@@ -521,21 +525,50 @@ async function main() {
     ws.on("close", () => console.log("[ws] disconnected"));
   });
 
-  server.listen(PORT, HOST, () => {
-    const hostShown = HOST === "0.0.0.0" ? "localhost" : HOST;
-    const url = `http://${hostShown}:${PORT}/${TOKEN ? `?token=${TOKEN}` : ""}`;
-    console.log("");
-    console.log("  sim-stream running");
-    console.log(`  → ${url}`);
-    if (TOKEN) console.log(`  token:     ${TOKEN}`);
-    console.log(`  simulator: ${sim.name} (${sim.udid})`);
-    console.log(`  stream:    ${FPS}fps scale=${SCALE} quality=${QUALITY}`);
-    console.log("");
-  });
+  // Provider may advise a bind host (e.g. lan -> 0.0.0.0, tailscale-* -> 127.0.0.1).
+  // An explicit --host always wins.
+  let bindHost = HOST;
+  if (REMOTE?.prepare && !HOST_EXPLICIT) {
+    const adj = REMOTE.prepare();
+    if (adj?.host) bindHost = adj.host;
+  }
 
-  const shutdown = () => {
+  await new Promise((resolve) => server.listen(PORT, bindHost, resolve));
+
+  let remoteEndpoint = null;
+  if (REMOTE?.start) {
+    try {
+      remoteEndpoint = await REMOTE.start({ port: PORT, token: TOKEN });
+    } catch (e) {
+      console.error(`[remote:${REMOTE.name}] ${e.message}`);
+      process.exit(1);
+    }
+  }
+
+  const hostShown = bindHost === "0.0.0.0" ? "localhost" : bindHost;
+  const localUrl = `http://${hostShown}:${PORT}/${TOKEN ? `?token=${TOKEN}` : ""}`;
+  console.log("");
+  console.log("  sim-stream running");
+  console.log(`  local:     ${localUrl}`);
+  if (remoteEndpoint) {
+    const label = `${REMOTE.name}:`.padEnd(10);
+    if (remoteEndpoint.url) console.log(`  ${label} ${remoteEndpoint.url}`);
+    if (remoteEndpoint.note) console.log(`             ${remoteEndpoint.note}`);
+  }
+  if (TOKEN) console.log(`  token:     ${TOKEN}`);
+  console.log(`  simulator: ${sim.name} (${sim.udid})`);
+  console.log(`  stream:    ${FPS}fps scale=${SCALE} quality=${QUALITY}`);
+  console.log("");
+
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log("\n[shutdown] cleaning up...");
     hub.stop();
+    if (REMOTE?.stop) {
+      try { await REMOTE.stop(); } catch {}
+    }
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 1500);
   };

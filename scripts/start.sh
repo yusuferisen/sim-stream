@@ -2,13 +2,16 @@
 # sim-stream: boot an iOS simulator and serve it to a web browser.
 #
 # Usage:
-#   ./scripts/start.sh                # auto-pick a simulator, start server
-#   ./scripts/start.sh --list         # list available simulators and exit
-#   ./scripts/start.sh --udid <UDID>  # use a specific simulator
-#   ./scripts/start.sh --port 9090    # custom port (default 8080)
-#   ./scripts/start.sh --host 0.0.0.0 # expose on LAN (default 127.0.0.1)
-#   ./scripts/start.sh --no-auth      # disable token auth (local only!)
-# Any extra flags are passed through to node server.js.
+#   ./scripts/start.sh                           # auto-pick a simulator, start server
+#   ./scripts/start.sh --list                    # list available simulators and exit
+#   ./scripts/start.sh --udid <UDID>             # use a specific simulator
+#   ./scripts/start.sh --port 9090               # custom port (default 8080)
+#   ./scripts/start.sh --remote lan              # bind to 0.0.0.0 (LAN access)
+#   ./scripts/start.sh --remote tailscale-serve  # private HTTPS over tailnet
+#   ./scripts/start.sh --remote tailscale-funnel # PUBLIC HTTPS via Funnel
+#   ./scripts/start.sh --no-auth                 # disable token auth (local only!)
+# Any extra flags are passed through to node server.js. See README.md for the
+# full --remote provider list and prerequisites.
 
 set -eu
 
