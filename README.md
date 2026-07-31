@@ -28,6 +28,9 @@ have an iPhone nearby.
                                              └──────────────────────┘
 ```
 
+Status and what's planned: see [`PROGRESS.md`](PROGRESS.md). Architecture,
+decisions, and history live in [`docs/`](docs/).
+
 ## Requirements
 
 - macOS with Xcode + iOS Simulator installed (`xcrun simctl` available)
@@ -117,31 +120,6 @@ token is your only auth.
 `stop`). To add e.g. a Cloudflare quick tunnel, drop a new entry into the
 `PROVIDERS` map and it becomes selectable as `--remote <name>`. No other
 code changes.
-
-### Roadmap
-
-Future remote-access improvements worth picking up when needed:
-
-- **`cloudflared` provider** — Cloudflare Tunnel quick mode
-  (`cloudflared tunnel --url http://127.0.0.1:<port>`) as a fallback when
-  Tailscale isn't available, or when you need Cloudflare's larger
-  edge / DDoS protection. Trade-off: MJPEG can buffer through Cloudflare;
-  test before relying on it.
-- **`cloudflare-access` provider** — Named Cloudflare Tunnel on your own
-  domain, gated by Cloudflare Access (email magic link / OAuth / IP
-  rules). This is the real defense-in-depth option for durable public
-  shares: a leaked URL+token still has to clear an SSO check. Free for
-  up to 50 users.
-- **`ngrok` provider** — same shape, useful for one-off shares without a
-  Cloudflare account.
-- **Cookie-set-on-first-load token handoff** — instead of leaving the
-  token in the URL bar (where it's visible to shoulder-surfers and
-  history sync), set an httpOnly cookie on the first authenticated load
-  and strip the token from the URL. Reduces accidental leakage when
-  someone screen-shares the page.
-- **Per-share, time-limited tokens** — generate a token that expires
-  after N hours so demo links don't live forever. Useful when sharing
-  Funnel URLs with people outside your tailnet.
 
 ## Using the UI
 
