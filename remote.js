@@ -9,6 +9,10 @@
 //   start({ port, token })   -> { url, note? } | Promise     // after  listen()
 //   stop()                   -> void | Promise               // on shutdown
 //
+// Every hook is OPTIONAL — the server calls each through optional chaining, so
+// a provider implements only what it needs (`lan` has no stop()). But one that
+// spawns a long-lived process must implement stop(), or it leaks past exit.
+//
 // Built-ins:
 //   lan               — bind on 0.0.0.0, reachable on the local network
 //   tailscale-serve   — private HTTPS on the tailnet (auto TLS via MagicDNS)

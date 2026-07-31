@@ -142,3 +142,10 @@ Also decided during the same pass: the README's `### Roadmap` section became
 plan prose in `docs/ROADMAP.md` plus checklist items in `PROGRESS.md`, since
 the contract permits exactly one live checklist and bans planning state in the
 human front door.
+
+**`docs/JOURNAL.md` keeps its commit shas.** The doc contract says "no commit
+sha," but its stated rationale is that a commit cannot contain its own sha —
+which doesn't reach the *prior* shas cited in the reconstructed Phase 1–4
+entries. They're the fastest route from a phase entry to the code that landed
+it. Recorded here so a later conformance pass doesn't strip them and start a
+loop.

@@ -116,10 +116,12 @@ token is your only auth.
 
 ### Adding new remote providers
 
-`remote.js` exposes a tiny provider interface (`prepare` / `start` /
-`stop`). To add e.g. a Cloudflare quick tunnel, drop a new entry into the
-`PROVIDERS` map and it becomes selectable as `--remote <name>`. No other
-code changes.
+`remote.js` exposes a tiny provider interface — `prepare` (advise a bind
+host), `start` (bring the tunnel up, return the URL to print), and `stop`
+(tear it down). All three are optional: implement only what you need, but a
+provider that spawns a long-lived process needs `stop` or it leaks past exit.
+To add e.g. a Cloudflare quick tunnel, drop a new entry into the `PROVIDERS`
+map and it becomes selectable as `--remote <name>`. No other code changes.
 
 ## Using the UI
 
@@ -154,7 +156,7 @@ All flags can be passed to `scripts/start.sh` or to `node server.js` directly:
 | `--quality <N>`  | `75`        | JPEG quality (1–100)                          |
 | `--scale <N>`    | `0.5`       | Frame size multiplier (0.1–1.0)               |
 | `--udid <UDID>`  | auto        | Specific simulator UDID                       |
-| `--token <str>`  | random hex  | Auth token (also accepted as `?token=…`)      |
+| `--token <str>`  | random hex  | Auth token. HTTP accepts `?token=…` or an `x-token` header; the WebSocket accepts `?token=…` only |
 | `--auth false`   | on          | Disable auth (local only)                     |
 | `--no-auth`      | —           | Same as `--auth false` (start.sh shorthand)   |
 | `--remote <p>`   | —           | Remote-access provider: `lan`, `tailscale-serve`, `tailscale-funnel` |

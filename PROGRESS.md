@@ -71,11 +71,15 @@
 ## Next Concrete Action
 
 > Implement 5.1: in `server.js`, have `authCheck` set an httpOnly cookie after a
-> successful `?token=…` match on `GET /` and redirect to the token-free URL;
-> extend `tokenMatches` callers so `/stream`, `/api/info`, and the
-> `server.on("upgrade")` handler each accept the cookie as well as the query
-> param. Verify by loading the URL on a phone, confirming the address bar no
-> longer shows the token and the stream plus WebSocket input still work.
+> successful match on `GET /`, then redirect to the token-free URL. Two check
+> sites must end up agreeing, and they differ today: `authCheck` (used by `/`,
+> `/api/info`, `/stream`) accepts `?token=` **or** the `x-token` header, while
+> the `server.on("upgrade")` handler accepts `?token=` only. Both need the
+> cookie added — and decide explicitly whether `x-token` stays for scripted
+> access rather than leaving it as an unnoticed bypass. Keep close code `1008`
+> as the auth-failure signal; the client's error toast depends on it. Verify by
+> loading the URL on a phone: the address bar no longer shows the token and the
+> stream plus WebSocket input still work.
 
 ---
 
@@ -89,7 +93,7 @@
 
 ## Needs You (irreversible / load-bearing — halts the run)
 
-- _none_
+- **Verify the inferred `docs/PRD.md`** — `/adopt` wrote it on 2026-07-31 from the code and README, not from anything you authored. Once confirmed it is frozen, and later work treats it as intent of record. The load-bearing parts to check are the five principles and the out-of-scope list. (not blocking until the next planning session — `/clarify` or `/plan`)
 
 ---
 
@@ -100,7 +104,7 @@
 - **`boundsForDeviceType()` is a hand-maintained table.** A simulator model missing from it mis-maps taps silently — check `/api/info` bounds first when taps land wrong.
 - **The token never expires and rides in the URL.** On a `tailscale-funnel` URL it is the only gate. Phase 5 exists for this.
 - **Cloudflare's edge may buffer `multipart/x-mixed-replace`.** Test an actual tunnel before recommending either Phase 6 provider over Tailscale.
-- **`docs/PRD.md`, `docs/OVERVIEW.md`, and `docs/architecture.md` were inferred by `/adopt` on 2026-07-31** from the code and README — verify before treating them as intent of record.
+- **`docs/OVERVIEW.md` and `docs/architecture.md` were inferred by `/adopt` on 2026-07-31** from the code — their claims were source-verified in review, but they describe intent they weren't written from. (The PRD's verification is tracked under Needs You.)
 
 ---
 

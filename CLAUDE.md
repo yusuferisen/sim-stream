@@ -53,6 +53,8 @@ Prerequisites: macOS with Xcode simulators, Node 18+ (ESM),
 - Keep the dependency list tiny. Zero cloud services is a product constraint,
   not an implementation detail — see `docs/PRD.md` § Principles.
 - Adding a remote-access provider means one entry in `remote.js`'s `PROVIDERS`
-  map and nothing else.
+  map and nothing else. All three hooks (`prepare` / `start` / `stop`) are
+  optional — but a provider that spawns a tunnel process must implement `stop`
+  or leak it past exit.
 - A new simulator model needs an entry in `boundsForDeviceType()`; without one,
   taps mis-map silently.

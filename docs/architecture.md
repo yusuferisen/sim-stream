@@ -60,9 +60,10 @@ if nothing throws.
   on the first client and stops 5 s (`graceMs`) after the last one leaves.
   Page reloads are a leave-then-join inside that window and must not restart
   AXe.
-- **Only the current generation may act on exit.** Each spawn bumps
-  `generation`; the exit handler compares before reacting. Without this, a
-  dying old process tears down its replacement.
+- **Only the current generation may act.** Each spawn bumps `generation`; the
+  data handler *and* the exit handler each capture it and compare before doing
+  anything. Without it, a dying old process tears down its replacement and its
+  trailing stdout bleeds into the new stream.
 - **Status is broadcast, never inferred.** `idle | live | dead` transitions
   emit to every WebSocket client, so a viewer that connected while the stream
   was dead learns when it recovers. The client must not derive status from
@@ -71,10 +72,15 @@ if nothing throws.
   only the server knows logical points. `dispatchInput`'s `pt()` clamps to
   `[0,1]` before scaling by `bounds`, so a malformed or out-of-range event
   cannot produce an off-screen coordinate.
-- **Auth is checked on all three entry paths.** HTTP routes via the `authCheck`
-  middleware, the WebSocket at `server.on("upgrade")` before
-  `handleUpgrade`, and `/stream` through the same middleware. A new entry point
-  without a check is a hole.
+- **Auth is checked at two sites, and they are not symmetric.** Every HTTP
+  route (`/`, `/api/info`, `/stream`) goes through the `authCheck` middleware,
+  which accepts **either** `?token=` **or** an `x-token` request header. The
+  WebSocket is checked separately in `server.on("upgrade")` before
+  `handleUpgrade`, and accepts **only** `?token=`. The browser client uses the
+  query param for both and never sends `x-token` — that header exists for
+  scripted access. Any change to how credentials are carried has to touch both
+  sites *and* account for the header. A new entry point without a check is a
+  hole.
 - **Token comparison is constant-time.** `tokenMatches()` uses
   `crypto.timingSafeEqual` on equal-length buffers. Never replace it with `===`.
 - **Value flags fail loudly.** Flags in `VALUE_FLAGS` raise if their value is
@@ -85,11 +91,27 @@ if nothing throws.
 
 Places designed to be extended, and the contract each one implies.
 
-- **Remote providers** (`remote.js`, the `PROVIDERS` map). A provider is an
-  object with `prepare` / `start` / `stop` and may advise a bind host — `lan`
-  advises `0.0.0.0`, the Tailscale providers advise `127.0.0.1` and tunnel to
-  it. An explicit `--host` always wins over a provider's advice. Adding a
-  provider is one map entry; no other file changes.
+- **Remote providers** (`remote.js`, the `PROVIDERS` map). **Every hook is
+  optional** — the server calls each through optional chaining, so a provider
+  implements only what it needs. `lan` has just `prepare` + `start`; only the
+  Tailscale providers implement `stop`.
+  - `prepare() → {host}` — advises a bind address before `listen`. `lan`
+    advises `0.0.0.0`; the Tailscale providers advise `127.0.0.1` and tunnel to
+    it. An explicit `--host` always wins over the advice.
+  - `start({port, token}) → {url, note}` — establishes the tunnel and returns
+    what to print. Throwing here exits the process with the provider's message,
+    so failures should carry an actionable one (the Tailscale providers parse
+    the admin-console URL out of the CLI error and put it here).
+  - `stop()` — teardown on shutdown. **A provider that spawns a long-lived
+    process must implement it** or leak that process past exit.
+
+  Adding a provider is one map entry; no other file changes.
+- **Simulator selection** (`pickSimulator`). Also hand-maintained: with no
+  `--udid` it takes any already-booted device, otherwise walks a hardcoded
+  preference ladder (iPhone 17 Pro non-Max → any iPhone 17 → any iPhone) and
+  **throws `No iPhone simulator available`** when nothing matches — an
+  iPad-only host cannot start the server at all. Widening platform support
+  starts here, not in the bounds table.
 - **Input events** (`dispatchInput`'s switch). Cases: `tap`, `long-press`,
   `swipe`, `type`, `key`, `button`. Unknown types throw, which surfaces as a
   `{type:"error"}` ack rather than a silent no-op. Adding an event type means
@@ -119,6 +141,12 @@ Deliberate, and worth knowing before "fixing" them:
 - **The MJPEG response sets `X-Accel-Buffering: no` and `Connection: close`.**
   Proxies that buffer a `multipart/x-mixed-replace` body break the stream —
   relevant to any future CDN-fronted provider.
+- **The client recovers on its own.** The WebSocket retries with exponential
+  backoff from 1500 ms; close codes `1006` and `1008` are read as auth failure
+  and surface a single toast rather than a retry storm. The MJPEG `<img>` is
+  kicked to force a reconnect, which is what makes the server respawn AXe.
+  Anything that changes how credentials are carried must keep `1008` meaning
+  "your credential is bad" — it is the client's only auth feedback channel.
 
 ## Testing strategy
 
