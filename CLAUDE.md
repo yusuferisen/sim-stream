@@ -50,8 +50,10 @@ Prerequisites: macOS with Xcode simulators, Node 18+ (ESM),
   `docs/DECISIONS.md`.
 - **No status or changelog sections in this file or `README.md`.** Completion
   truth lives only in `PROGRESS.md`; history only in `docs/JOURNAL.md`.
-- Keep the dependency list tiny. Zero cloud services is a product constraint,
-  not an implementation detail — see `docs/PRD.md` § Principles.
+- Keep the dependency list tiny. Nothing hosted may be *required* to install,
+  start, or use the tool — that's a product constraint, not an implementation
+  detail. Opt-in `--remote` providers are the deliberate exception; the default
+  path stays offline-capable. See `docs/PRD.md` § Principles.
 - Adding a remote-access provider means one entry in `remote.js`'s `PROVIDERS`
   map and nothing else. All three hooks (`prepare` / `start` / `stop`) are
   optional — but a provider that spawns a tunnel process must implement `stop`

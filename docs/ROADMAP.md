@@ -26,12 +26,17 @@ bar, in browser history, in history sync, and in any screen-share of the page.
   `httpOnly` cookie, then redirect to a clean URL. Subsequent requests —
   including the `/stream` MJPEG connection and the `/ws` upgrade — authenticate
   from the cookie. The token stops being shoulder-surfable and stops landing in
-  history.
+  history. The `x-token` header **stays**: a header never reaches the URL bar,
+  history, or a screen-share, so it is the safest of the three channels, and
+  it's the scripted/`curl` path.
 - **Per-share, time-limited tokens.** Mint a token that expires after N hours,
   so a Funnel URL handed to someone for a demo stops working on its own.
   Implies more than one live token at a time, which the current single-`TOKEN`
-  comparison doesn't model — the server needs a small token registry
-  (value, expiry, label) rather than one constant.
+  comparison doesn't model — the server needs a small registry (value, expiry,
+  label) rather than one constant. **In-memory, minted at startup** via
+  repeatable flags; the registry dies with the process, which makes restarting
+  a guaranteed revoke-everything. No mint-over-HTTP: a token that can mint
+  successors defeats expiry as a boundary.
 
 **Out of scope.** Accounts, an identity provider, or any login UI. The whole
 point of the design is that a URL is the credential; these items make the
@@ -44,41 +49,61 @@ the token in the URL.
 
 ---
 
-## Phase 6 — Defense-in-depth remote providers
+## Phase 6 — Cloudflare quick tunnel
 
-**Why.** Tailscale Funnel's security model is "the URL is public, the token is
-the gate." Cloudflare offers a strictly better shape for durable shares: put a
-real access check *in front of* the tunnel, so a leaked URL plus a leaked token
-still has to clear an SSO prompt.
+**Why.** A second exit route that needs no account at all. `cloudflared tunnel
+--url http://127.0.0.1:<port>` mints an anonymous `trycloudflare.com` hostname
+on the spot — useful when Tailscale isn't installed, when its macOS GUI-agent
+path is hanging (a failure we've already hit), or when you want Cloudflare's
+larger edge in front of the stream.
 
-**Scope.**
+**Scope.** One `PROVIDERS` entry implementing `prepare` (bind `127.0.0.1`),
+`start` (spawn the tunnel, parse the assigned hostname out of its output,
+return the URL), and `stop` — **`stop` is mandatory here**: the tunnel is a
+long-lived child process and without teardown it outlives the server.
 
-- **`cloudflared` provider** — Cloudflare Tunnel in quick mode
-  (`cloudflared tunnel --url http://127.0.0.1:<port>`). A fallback for when
-  Tailscale isn't installed or its macOS GUI-agent path is misbehaving, and a
-  path onto Cloudflare's larger edge. Fits the existing
-  `prepare`/`start`/`stop` interface with no changes elsewhere.
-- **`cloudflare-access` provider** — a *named* tunnel on your own domain gated
-  by Cloudflare Access (email magic link / OAuth / IP rules). This is the real
-  defense-in-depth option for public shares. Free up to 50 users.
+**Trade-off to settle before recommending it.** MJPEG is a single long-lived
+`multipart/x-mixed-replace` response and Cloudflare's edge may buffer it —
+which would surface as a stalled first frame or visible stutter. Verify against
+a real tunnel; if it buffers, say so in the README rather than quietly shipping
+a worse path than Tailscale.
 
-**Trade-off to test before relying on it.** MJPEG is a single long-lived
-`multipart/x-mixed-replace` response. Cloudflare's edge may buffer it, which
-would show up as stuttering or a stalled first frame. Verify with an actual
-tunnel before promoting either provider over Tailscale in the README.
-
-**Out of scope.** Cloudflare account provisioning, DNS setup, and Access policy
-authoring — all one-time manual prerequisites, documented like the Tailscale
-ones rather than automated.
+**Out of scope.** Installing `cloudflared` — treat a missing binary the way
+`start.sh` already treats a missing `axe`: fail immediately with the install
+command, don't attempt a download.
 
 ---
 
 ## 🏁 Milestone: Safe public sharing
 
 The stop point. After Phase 6, exposing this tool beyond the LAN no longer
-rests on a permanent secret sitting in a URL bar: the token is in a cookie,
-share links expire, and the strongest option puts an SSO check in front of the
-tunnel entirely. Everything past here is capability, not risk reduction.
+rests on a permanent secret parked in a URL bar: the credential rides in an
+httpOnly cookie, share links expire on their own, and killing the process
+revokes every outstanding link. Everything past here is capability, not risk
+reduction.
+
+---
+
+## Phase 6b — Gated public sharing (Cloudflare Access)
+
+**Deferred past the milestone, deliberately** — see `DECISIONS.md § Phase 6.2
+deferred`. This is the only option where a leaked URL *and* a leaked token
+still don't get someone in: a *named* Cloudflare tunnel on a domain you own,
+with Cloudflare Access (email magic link / OAuth / IP rules) in front. Free up
+to 50 users.
+
+**Why it isn't in the milestone.** It requires a domain on a Cloudflare
+account, which doesn't exist yet. The phase could be written but not verified,
+and an unverifiable item shouldn't gate a stop point.
+
+**Prerequisite before this phase can start:** a domain on Cloudflare, a named
+tunnel, and an Access policy. All one-time manual setup — documented like the
+Tailscale prerequisites, never automated.
+
+**Note on intent.** This phase is the reason `docs/PRD.md` principle 2 was
+amended: it puts a login in front of the stream, which the original inferred
+wording banned outright. The settled position is that a gate is legitimate as
+an *opt-in per-share choice* and never as the default path.
 
 ---
 

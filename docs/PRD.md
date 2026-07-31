@@ -1,11 +1,14 @@
 # PRD — sim-stream
 
-> **Inferred by /adopt from the codebase — verify.** This repo was born outside
-> the planning pipeline and had no product-intent document. The intent below was
-> reconstructed on 2026-07-31 from the README's framing, the shape of the code,
-> and the reasoning recorded in the SimCast build-vs-adopt evaluation. Correct
-> anything wrong here now — once verified, this file is frozen and later work
-> treats it as intent of record.
+> **Reconstructed by `/adopt`, verified and amended by `/clarify` on
+> 2026-07-31 — now frozen.** This repo was born outside the planning pipeline
+> and had no product-intent document; the intent below was reconstructed from
+> the README's framing, the shape of the code, and the SimCast build-vs-adopt
+> evaluation, then reviewed. Principle 2 and the hosted-infrastructure
+> out-of-scope line were corrected during that review — the original inference
+> was stricter than actual intent and would have forbidden a remote provider
+> the author had already planned. See `DECISIONS.md § PRD verified and amended`.
+> Further changes are deviations: record them in `DECISIONS.md`, not here.
 
 ## The problem
 
@@ -37,10 +40,15 @@ These are the constraints that decide arguments, in priority order.
    an account, a cloud project, a migration, or a deploy step to the basic path
    is rejected regardless of what it buys. This principle alone decided the
    build-vs-adopt evaluation.
-2. **A URL is the credential.** Sharing means sending a link — no invites, no
-   sign-in, no identity provider on either end. Access control may get
-   *stronger* (expiry, a cookie, an SSO check in front of the tunnel) but must
-   never become a login the viewer has to complete to look at a screen.
+2. **A URL is the credential — on the default path.** Sharing means sending a
+   link: no account to create, no invite flow, no identity provider standing
+   between you and the screen. Access control may get stronger *along that
+   path* — expiry, an httpOnly cookie instead of a query string — without
+   changing its shape. An **opt-in** `--remote` provider may additionally put a
+   gate in front of its tunnel for durable public shares; that is a deliberate
+   per-share choice, never the default, and never required to view a simulator
+   on your own machine or LAN. What stays banned is making a login the *only*
+   way in.
 3. **No cloud dependencies.** The tool works offline and on an air-gapped
    network. Nothing runs on someone else's infrastructure by default.
 4. **A tool, not a platform.** One simulator, one viewer session, one process.
@@ -64,9 +72,18 @@ These are the constraints that decide arguments, in priority order.
 Each of these was considered and rejected; reopening one is a change of intent,
 not a feature request.
 
-- **Accounts, teams, and multi-user access.** See principle 2.
-- **Hosted infrastructure of any kind** — auth providers, realtime services,
-  object storage, managed video transport. See principle 3.
+- **A user model inside sim-stream.** No accounts, no teams, no roles, no
+  per-viewer identity — the server will never know who is watching, only
+  whether the request carried a valid credential. An **opt-in `--remote`
+  provider's** gate may maintain its own allowlist (a Cloudflare Access policy,
+  say); that list lives outside the tool and never becomes a concept the server
+  understands. See principle 2.
+- **Hosted infrastructure on the path to a running tool.** Nothing may be
+  required to install, start, or use sim-stream: no realtime service, no object
+  storage, no managed video transport, no auth provider standing in front of
+  the local or LAN experience. The one exception is an **opt-in `--remote`
+  provider's own service** — Tailscale today, Cloudflare later — chosen per run
+  by the operator. See principle 3.
 - **Multi-simulator dashboards.** One at a time is the design.
 - **A durable, synced artifact library.** Screenshots land on the host's
   filesystem. Syncing them reproduces exactly the persistence complexity that

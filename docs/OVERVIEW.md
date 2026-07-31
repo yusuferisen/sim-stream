@@ -10,8 +10,10 @@
 server on the Mac that hosts the simulator spawns the [AXe
 CLI](https://github.com/cameroncooke/AXe) to capture frames and to inject
 input, and serves both over plain HTTP/WebSocket behind a token in the URL.
-There are no cloud services, no accounts, and no build step — `npm i && node
-server.js`.
+There is no account, no hosted backend, and no build step — `npm i && node
+server.js`. Reaching it from outside the machine is opt-in: `--remote` selects
+a provider (Tailscale today), and that is the only point at which anything
+leaves the host.
 
 ## Architecture
 

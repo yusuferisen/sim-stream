@@ -27,8 +27,12 @@ process.
 - **External binaries:** `axe` (capture + HID injection) and `xcrun simctl`
   (device enumeration, boot, screenshots). Both must exist on the host; neither
   is installable in CI, which is why there is no CI.
-- **Zero network services.** No cloud, no auth provider, no storage. This is a
-  load-bearing property, not an accident — see `docs/DECISIONS.md`.
+- **No network service on the default path.** Running the tool requires no
+  account, no hosted backend, no auth provider, and no storage — it works
+  offline and air-gapped. The shipped Tailscale providers (and Cloudflare
+  later) are hosted services, but they are **opt-in per run** via `--remote`
+  and nothing depends on them otherwise. That asymmetry is load-bearing, not
+  accidental — see `docs/PRD.md` § Principles and `docs/DECISIONS.md`.
 
 ## Data flow
 
