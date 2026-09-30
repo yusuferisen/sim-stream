@@ -80,6 +80,7 @@ flowchart TB
     sim -- "frames" --> axe
     src -. "--device: GET WDA MJPEG via ios forward" .-> wda["WebDriverAgent<br/>on a bench device"]
     shot -. "--device: WDA /screenshot · /window/size" .-> wda
+    queue -. "--device: WDA /actions · /wda/keys · /elements · /wda/homescreen" .-> wda
     hub -. "status: idle | live | dead (broadcast to all WS)" .-> ptr
     vhub -. "status: idle | live | dead (broadcast to all WS)" .-> ptr
     remote -. "establishes the tunnel the browser reaches" .-> srv
@@ -163,11 +164,16 @@ its WDA port through `qa-device`; `--device <udid> --wda <url>` works without
 it). The server checks WDA, names the device from go-ios (`MGL-QA-16E`), sets
 WDA's stream to the `--fps`/`--scale`/`--quality` flags (30 fps by default
 here), forwards the device's MJPEG port with `ios forward`, and serves the
-same page, links and shares — the picture runs at ~28 fps. The device is
-view-only for now: every input answers "input on a real device is not
-supported yet", while the screenshot control works (WDA's `/screenshot`). A
-WDA that does not answer stops startup with `Start it with: qa-device up
-<role>`; the forward is removed when the server exits.
+same page, links and shares — the picture runs at ~28 fps. Input goes
+through WDA, one command at a time: touches as W3C pointer actions (~1 s per
+tap on the 16e), text and Return/Backspace/Tab/Space through `/wda/keys`
+(Unicode works), Home via `/wda/homescreen`, Lock via `/wda/lock`, tap by label
+as a WDA element lookup. Before each command the server checks whether the
+device auto-locked and, if so, unlocks it with a home-screen press; a tap or
+swipe aimed at the lock screen is spent on that unlock. Siri, Apple Pay,
+Escape and the arrow keys are refused with an error toast. Screenshots are
+WDA's `/screenshot`. A WDA that does not answer stops startup with `Start it
+with: qa-device up <role>`; the forward is removed when the server exits.
 
 **Drive the UI by touch.** Click or tap to tap; drag to swipe; hold ≥500 ms
 without moving for a long-press. The browser sends normalized `(0..1, 0..1)`
@@ -181,9 +187,16 @@ in one command rather than keystroke-by-keystroke.
 
 **Tap an element by name.** The "Tap by Label" field takes an accessibility
 label (`Sign In`) or `#` plus an accessibility identifier (`#login.submit`);
-Enter or **Tap** sends it. AXe finds the element and taps it — no pixel
-hunting when checking agent-built UI. A label that matches nothing, or more
-than one element, taps nothing and shows AXe's own message in the error toast.
+Enter or **Tap** sends it. AXe (or, on a device, WDA) finds the element and
+taps it — no pixel hunting when checking agent-built UI. A label that matches
+nothing, or more than one element, taps nothing and says so in the error
+toast. On a device only on-screen matches count, a control whose own icon and
+text share its label counts once, and `#id` matches WDA's `name` (the
+identifier, or the label when there is none).
+
+**See why an input was refused.** Every error ack the server sends shows as a
+red toast — a failed tap by label, a key or button the target cannot press, a
+WDA or AXe failure.
 
 **Press hardware buttons and send quick gestures.** Home, Lock, and Siri are
 buttons in the panel. The ▲/▼/←/→ controls send preset swipes from the center
@@ -233,13 +246,16 @@ Known and accepted, not defects:
   delivers, so there the `--fps` flag is an upper bound it won't reach — which
   includes every plain-http `--remote lan` link, since browsers decode H.264
   only on https or `localhost`.
-- **US keyboard only.** AXe's `type` uses HID keycodes — no accented or
-  non-ASCII characters.
+- **US keyboard only on a simulator.** AXe's `type` uses HID keycodes — no
+  accented or non-ASCII characters (a device types Unicode through WDA).
 - **Single touch.** No pinch, no rotate, no multi-finger gestures.
 - **One target per server.** A simulator or a device, fixed at startup;
   `--device` and `--udid` refuse each other.
-- **A device is view-only, MJPEG-only for now.** No input and no H.264 from a
-  device yet; a device that auto-locks shows its lock screen.
+- **A device is MJPEG-only for now, and slower to drive.** No H.264 from a
+  device yet. WDA answers a touch once the app is idle (~1 s a tap); Home
+  pressed on the home screen answers only after ~10 s, holding the queue; the
+  Lock button times out on the iOS 26 bench (WDA cannot lock it). A device that
+  auto-locks shows its lock screen until the next input unlocks it.
 - **No stream heartbeat beyond start/stop.** If the AXe process *hangs* rather
   than exits, the status dot can stay green until something eventually throws.
   The H.264 pipeline's status stays `live` too, but the page notices the

@@ -7,6 +7,8 @@
 //   wdaSettings(mjpeg)           --fps/--scale/--quality → WDA's MJPEG settings (pure)
 //   deviceTarget(info, udid)     `ios info` JSON → the backend's `target` (pure)
 //   parseBoundary(contentType)   the multipart boundary from a Content-Type (pure)
+//   wdaInputRequest(evt, bounds) input event → one WDA request (pure)
+//   labelPredicate / pickLabelTarget  tap-by-label lookup and choice (pure)
 //
 // Video is WDA's own MJPEG server (device port 9100), reached through an
 // `ios forward` (go-ios) child this backend owns: a free host port is picked
@@ -16,8 +18,11 @@
 // /screenshot. The tool never starts WDA or the tunnel: a missing WDA fails
 // at startup with `qa-device up <role>`.
 //
-// Input is not wired yet (Phase 9.3): every event is refused with an error
-// ack. H.264 is off (Phase 9.4).
+// Input goes through WDA one command at a time (a SerialQueue): taps,
+// long-presses and swipes as W3C touch actions in points, text and the
+// special keys WDA can type through /wda/keys, home and lock through WDA, tap
+// by label as an element lookup plus a tap. A locked device is woken first.
+// H.264 is off (Phase 9.4).
 //
 // Import-safe: nothing runs until createDeviceBackend() is called. Covered by
 // test/device-backend.test.js against a fake WDA server and
@@ -29,13 +34,21 @@ import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 
+import { parseTapTarget } from "../tap-label.js";
+import { SerialQueue } from "./queue.js";
+
 // qa-device's bench roles. Anything else given to --device is a UDID.
 export const BENCH_ROLES = Object.freeze(["primary", "secondary", "tablet"]);
 export const DEFAULT_WDA = "http://localhost:8100";
 // Where WDA's MJPEG server listens on the device.
 export const DEVICE_MJPEG_PORT = 9100;
-export const INPUT_NOT_SUPPORTED = "input on a real device is not supported yet (Phase 9.3)";
 export const IOS_INSTALL = "npm i -g go-ios";
+// The W3C key an element reference comes under (WDA also sends legacy ELEMENT).
+const W3C_ELEMENT = "element-6066-11e4-a52e-4f735466cecf";
+// Above this many label matches, nothing is measured: the answer is "several".
+const MAX_LABEL_MATCHES = 20;
+// Coordinate gestures: spent on waking a locked device instead of dispatched.
+const POINTER_EVENTS = new Set(["tap", "long-press", "swipe"]);
 
 // --- Pure pieces -------------------------------------------------------------
 
@@ -96,6 +109,141 @@ export function resolveDeviceSpec(spec, { wda = null, run = runSync } = {}) {
   return { udid, wda: wda || `http://localhost:${port}`, role: value };
 }
 
+// --- Input translation (pure) ------------------------------------------------
+
+// The special keys WDA's /wda/keys can express, as the characters XCTest
+// types for them. Others (escape, arrows, forward delete, HID codes) are
+// refused rather than approximated (DECISIONS.md § Phase 9 pre-flight defaults).
+export const DEVICE_KEYS = Object.freeze({
+  return: "\n", enter: "\n",
+  backspace: "\b",
+  tab: "\t",
+  space: " ",
+});
+
+// Hardware buttons → WDA. `home` is WDA's sessionless /wda/homescreen:
+// `pressButton home` answers success and does nothing on the iOS 26 bench.
+// The press lands at once, but with the home screen already in front WDA
+// answers only after ~10 s (and runs nothing else meanwhile) — hence 15 s.
+// `lock` and `side-button` are one button on a device. Siri and Apple Pay have
+// no WDA equivalent a button can press (Siri needs a typed request's text);
+// `screenshot` never gets here (server.js).
+export const DEVICE_BUTTONS = Object.freeze({
+  home: { method: "POST", path: "/wda/homescreen", body: {}, sessionless: true, timeoutMs: 15_000 },
+  lock: { method: "POST", path: "/wda/lock", body: {}, timeoutMs: 15_000 },
+  "side-button": { method: "POST", path: "/wda/lock", body: {}, timeoutMs: 15_000 },
+});
+const REFUSED_BUTTONS = Object.freeze({
+  siri: "the Siri button is not available on a real device (WDA can only start Siri with a typed request)",
+  "apple-pay": "the Apple Pay button is not available on a real device",
+});
+
+// A W3C pointer-actions body for one finger: `steps` after an initial move to
+// `from`. WDA takes points and milliseconds.
+function touchActions(from, steps) {
+  return {
+    actions: [{
+      type: "pointer",
+      id: "finger1",
+      parameters: { pointerType: "touch" },
+      actions: [{ type: "pointerMove", duration: 0, x: from.x, y: from.y }, ...steps],
+    }],
+  };
+}
+
+export function tapActions(p, holdMs = 50) {
+  return touchActions(p, [
+    { type: "pointerDown", button: 0 },
+    { type: "pause", duration: holdMs },
+    { type: "pointerUp", button: 0 },
+  ]);
+}
+
+// One input event → the WDA request that performs it ({method, path, body,
+// timeoutMs?, sessionless?} — session-scoped unless `sessionless`), or null for an event that needs none
+// (`type` with nothing to type). `tap-label` is not here: it is a lookup, then
+// a tap (the backend's tapLabel). Throws the viewer's error toast on anything
+// a device cannot do. Points are normalized × bounds, clamped to the screen.
+export function wdaInputRequest(evt, bounds) {
+  const pt = (nx, ny) => ({
+    x: Math.round(Math.max(0, Math.min(1, Number(nx) || 0)) * bounds.w),
+    y: Math.round(Math.max(0, Math.min(1, Number(ny) || 0)) * bounds.h),
+  });
+  const ms = (v, dflt) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Math.round(Math.min(n, 10_000)) : dflt;
+  };
+  // WDA answers an action only once the app is idle again: ~1 s for a tap,
+  // over 10 s once for a scroll mid-animation (which still happened).
+  const actions = (body, gestureMs) => ({ method: "POST", path: "/actions", body, timeoutMs: 20_000 + gestureMs });
+  switch (evt?.type) {
+    case "tap":
+      return actions(tapActions(pt(evt.x, evt.y)), 50);
+    case "long-press": {
+      const hold = ms(evt.duration, 800);
+      return actions(tapActions(pt(evt.x, evt.y), hold), hold);
+    }
+    case "swipe": {
+      const move = ms(evt.duration, 300);
+      const b = pt(evt.toX, evt.toY);
+      return actions(touchActions(pt(evt.fromX, evt.fromY), [
+        { type: "pointerDown", button: 0 },
+        { type: "pause", duration: 50 },
+        { type: "pointerMove", duration: move, x: b.x, y: b.y },
+        { type: "pointerUp", button: 0 },
+      ]), move);
+    }
+    case "type": {
+      if (typeof evt.text !== "string" || !evt.text) return null;
+      // WDA types at ~60 characters a second.
+      return { method: "POST", path: "/wda/keys", body: { value: [evt.text] }, timeoutMs: Math.max(10_000, evt.text.length * 100) };
+    }
+    case "key": {
+      const name = typeof evt.key === "string" ? evt.key.toLowerCase() : null;
+      const ch = name !== null && Object.hasOwn(DEVICE_KEYS, name) ? DEVICE_KEYS[name] : undefined;
+      if (ch === undefined) throw new Error(`the ${evt.key} key is not available on a real device`);
+      return { method: "POST", path: "/wda/keys", body: { value: [ch] } };
+    }
+    case "button": {
+      const req = Object.hasOwn(DEVICE_BUTTONS, evt.name) ? DEVICE_BUTTONS[evt.name] : null;
+      if (req) return { ...req, body: { ...req.body } };
+      if (Object.hasOwn(REFUSED_BUTTONS, evt.name)) throw new Error(REFUSED_BUTTONS[evt.name]);
+      throw new Error(`unknown button: ${evt.name}`);
+    }
+    default:
+      throw new Error(`unknown event type: ${evt?.type}`);
+  }
+}
+
+// WDA's predicate for a tap-by-label target. WDA's `name` is the
+// accessibilityIdentifier, or the label when an element has none — WDA exposes
+// no identifier-only attribute. Quotes and backslashes are escaped for
+// NSPredicate's string literal.
+export function labelPredicate({ by, target }) {
+  const lit = `"${target.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  return `${by === "id" ? "name" : "label"} == ${lit}`;
+}
+
+// Which of the matched elements' rects ({x,y,width,height}, points) to tap,
+// as a point — or a thrown error toast. Off-screen elements (WDA reports them
+// with a zero rect, e.g. an icon on another home-screen page) are ignored.
+// Several on-screen matches are refused, as AXe does, unless one contains all
+// the others: a control and its own icon/text share a label.
+export function pickLabelTarget(rects, { by, target }, bounds) {
+  const what = `${by === "id" ? "#" : "label "}'${target}'`;
+  const center = (r) => ({ x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+  const onScreen = rects.filter((r) => {
+    if (!(r?.width > 0 && r?.height > 0)) return false;
+    const c = center(r);
+    return c.x >= 0 && c.y >= 0 && c.x <= bounds.w && c.y <= bounds.h;
+  });
+  if (onScreen.length === 0) throw new Error(`No on-screen element matched ${what}.`);
+  const contains = (a, b) => a.x <= b.x && a.y <= b.y && a.x + a.width >= b.x + b.width && a.y + a.height >= b.y + b.height;
+  const outer = onScreen.find((a) => onScreen.every((b) => contains(a, b)));
+  if (!outer) throw new Error(`Multiple (${onScreen.length}) on-screen elements matched ${what}. Tap by #identifier or by coordinates instead.`);
+  return center(outer);
+}
+
 function runSync(cmd, args) {
   return execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 });
 }
@@ -134,8 +282,8 @@ export class WdaClient {
   }
 
   // The same, but a non-2xx answer or a WDA error value rejects.
-  async call(method, path, body) {
-    const r = await this.request(method, path, body);
+  async call(method, path, body, timeoutMs = this.timeoutMs) {
+    const r = await this.request(method, path, body, timeoutMs);
     if (r.status >= 300 || r.value?.error) throw wdaError(method, path, r);
     return r.value;
   }
@@ -152,16 +300,16 @@ export class WdaClient {
     return id;
   }
 
-  async session(method, path, body) {
+  async session(method, path, body, timeoutMs = this.timeoutMs) {
     if (!this.sessionId) await this.createSession();
-    const r = await this.request(method, `/session/${this.sessionId}${path}`, body);
+    const r = await this.request(method, `/session/${this.sessionId}${path}`, body, timeoutMs);
     if (!isInvalidSession(r)) {
       if (r.status >= 300 || r.value?.error) throw wdaError(method, path, r);
       return r.value;
     }
     this.log("session gone — creating a new one and retrying once");
     await this.createSession();
-    return this.call(method, `/session/${this.sessionId}${path}`, body);
+    return this.call(method, `/session/${this.sessionId}${path}`, body, timeoutMs);
   }
 }
 
@@ -395,6 +543,35 @@ export async function createDeviceBackend({
     if (!stopping) log(`[device] ios forward exited (${sig || `code ${code}`}) — the stream cannot reconnect; restart the server`);
   });
 
+  const queue = new SerialQueue();
+
+  // Auto-lock is 3 minutes on the bench. WDA's /wda/unlock times out on an
+  // iOS 26 device while a home-screen press unlocks a passcode-free one at
+  // once, so that is the wake. Resolves true when the device was locked.
+  const wake = async () => {
+    if ((await client.session("GET", "/wda/locked")) !== true) return false;
+    log("[device] locked — pressing home to unlock");
+    await client.call("POST", "/wda/homescreen");
+    if ((await client.session("GET", "/wda/locked")) === true) {
+      throw new Error("the device is locked and could not be unlocked (does it have a passcode?)");
+    }
+    return true;
+  };
+
+  // Tap by label: WDA finds the elements, their rects pick the one to tap
+  // (pickLabelTarget), and the tap is a pointer action at its centre — WDA's
+  // element click reports success on an element that is off screen.
+  const tapLabel = async (t) => {
+    const found = await client.session("POST", "/elements", { using: "predicate string", value: labelPredicate(t) }, 15_000);
+    const ids = (Array.isArray(found) ? found : []).map((e) => e?.ELEMENT || e?.[W3C_ELEMENT]).filter(Boolean);
+    if (ids.length > MAX_LABEL_MATCHES) {
+      throw new Error(`Multiple (${ids.length}) elements matched ${t.by === "id" ? "#" : "label "}'${t.target}'. Tap by #identifier or by coordinates instead.`);
+    }
+    const rects = [];
+    for (const id of ids) rects.push(await client.session("GET", `/element/${id}/rect`));
+    await client.session("POST", "/actions", tapActions(pickLabelTarget(rects, t, bounds)));
+  };
+
   return {
     kind: "device",
     target,
@@ -411,8 +588,26 @@ export async function createDeviceBackend({
       throw new Error("H.264 is off: from a device it is not built yet (Phase 9.4)");
     },
 
-    async input() {
-      throw new Error(INPUT_NOT_SUPPORTED);
+    // Every command runs through one FIFO, after a wake check. A coordinate
+    // gesture that found the device locked is spent on waking it: the viewer
+    // aimed it at the lock screen, not at whatever is under it now.
+    async input(evt) {
+      if (evt?.type === "tap-label") {
+        const t = parseTapTarget(evt.text);
+        await queue.push(async () => {
+          await wake();
+          await tapLabel(t);
+        });
+        // parseTapTarget() proved the text a string.
+        return { detail: evt.text.trim() };
+      }
+      const req = wdaInputRequest(evt, bounds);
+      if (!req) return;
+      return queue.push(async () => {
+        if ((await wake()) && POINTER_EVENTS.has(evt.type)) return { detail: "unlocked" };
+        if (req.sessionless) await client.call(req.method, req.path, req.body, req.timeoutMs);
+        else await client.session(req.method, req.path, req.body, req.timeoutMs);
+      });
     },
 
     // WDA's screenshot is a base64 PNG; sessionless, never queued.

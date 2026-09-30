@@ -20,12 +20,12 @@ process.
 |---|---|
 | `server.js` | The target-agnostic server: arg parsing, the auth check sites, HTTP routes, both WebSocket endpoints, wiring the hubs to the backend, the screenshot control's destination, the banner, shutdown. Spawns nothing but `sips`. |
 | `backends/simulator.js` | The simulator backend (§ Backends): simulator discovery and boot, `axe` resolution, the bounds table, the `axe stream-video` MJPEG source (AXe's HTTP preamble stripped), the H.264 capture pipeline (AXe piped into the helper), input event → `axe` argv, `simctl` screenshots. Import-safe; its pure pieces (`pickSimulator`, `boundsForDeviceType`, `axeInputArgs`, `axeTimeoutMs`, `stripHttpPreamble`) are unit-tested. |
-| `backends/device.js` | The device backend (§ Backends, *Device backend*): `--device` resolution (a UDID, or a bench role through `qa-device`), the WDA client and its one-retry session recovery, WDA's MJPEG settings, the `ios forward` child it owns, bounds and screenshots from WDA. Import-safe; its pure pieces (`wdaSettings`, `deviceTarget`, `parseBoundary`, `resolveDeviceSpec`) and the whole startup are tested against a fake WDA and `test/fixtures/fake-ios`. |
+| `backends/device.js` | The device backend (§ Backends, *Device backend*): `--device` resolution (a UDID, or a bench role through `qa-device`), the WDA client and its one-retry session recovery, WDA's MJPEG settings, the `ios forward` child it owns, bounds, screenshots and input through WDA (wake, W3C touches, keys, buttons, tap by label). Import-safe; its pure pieces (`wdaSettings`, `deviceTarget`, `parseBoundary`, `resolveDeviceSpec`, `wdaInputRequest`, `labelPredicate`, `pickLabelTarget`) and the whole startup and input path are tested against a fake WDA and `test/fixtures/fake-ios`. |
 | `backends/queue.js` | `SerialQueue`: the strict FIFO every backend runs its input commands through. Pure. |
 | `mjpeg.js` | `MjpegHub`: refcount, grace window, generation guard and fan-out for the MJPEG source, source-agnostic. Pure, like `h264.js`: the source and the timers are handed in, so it is unit-testable without a simulator. |
 | `h264.js` | The H.264 path's logic (§ H.264 video path): the capture plan, the helper-record parser, the group-of-pictures cache, and `H264Hub` — refcount, grace window, generation guard and per-viewer delivery. Pure, like `shares.js`: the pipeline, the sockets, the clock and the timers are handed in, so it is unit-testable without a simulator. |
 | `shares.js` | The credential registry (`ShareRegistry`): the owner token plus expiring share tokens, constant-time matching, the definition of expiry, and the tracking that ends long-lived connections when a share dies. Pure — no I/O, no side effects at import, clocks injectable — so it is unit-testable without a simulator. Also exports `parseTtl` / `parseShareSpec`. |
-| `tap-label.js` | Tap by accessibility label: the viewer's text → `axe tap --label=…` / `--id=…` arguments, and AXe's failure output → the one line the error toast shows. Pure; `tapLabelArgs` / `axeErrorLine`. |
+| `tap-label.js` | Tap by accessibility label: the viewer's text → a `{by, target}` both backends use (`parseTapTarget`), → `axe tap --label=…` / `--id=…` arguments, and AXe's failure output → the one line the error toast shows. Pure; `parseTapTarget` / `tapLabelArgs` / `axeErrorLine`. |
 | `gallery.js` | The screenshot gallery's rules (§ Screenshot gallery): the folder and file names, which names may be served (matched against the directory listing), the `sips` thumbnail cache, and the `/gallery` page. Import-safe; `sips` is handed in. |
 | `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`, plus the `cloudflared` provider's pieces for tests (`cloudflaredProvider` factory, output parsers, `waitForAuthoritativeDns`). Knows nothing about streaming or input. Import-safe: nothing runs until a provider's hook is called. |
 | `public/index.html` | The entire client — markup, styles, and script in one file: the H.264 player (WebCodecs → `<canvas>`), the MJPEG `<img>` it falls back to, the input layer. Served with one templated substitution. |
@@ -265,10 +265,36 @@ Places designed to be extended, and the contract each one implies.
   runtime: "iOS <ver>", deviceType: <ProductType>}`; `openMjpeg()` is an HTTP
   GET through the forward — WDA speaks real HTTP, so the body arrives bare —
   and throws if the forward has exited (nothing respawns it: restart the
-  server); `h264` is `{ok: false}` and `h264Pipeline()` throws; `input()`
-  rejects every event with `input on a real device is not supported yet`;
+  server); `h264` is `{ok: false}` and `h264Pipeline()` throws;
   `screenshot()` writes WDA's `/screenshot` (base64 PNG, sessionless) after
   checking the PNG signature.
+
+  *Input.* `input()` runs every command through its own `SerialQueue`, like
+  the simulator's. `wdaInputRequest(evt, bounds)` (pure) maps an event to one
+  WDA request: `tap` / `long-press` / `swipe` → `POST /actions`, one W3C
+  touch pointer in **points** (normalized × `bounds`, clamped; hold and move
+  durations capped at 10 s); `type` → `/wda/keys` with the text as one value;
+  `key` → `/wda/keys` with `DEVICE_KEYS` (`return`/`enter` `\n`,
+  `backspace` `\b`, `tab`, `space`) — any other key, and numeric HID codes,
+  throw; `button` → `DEVICE_BUTTONS` (`home` → the **sessionless**
+  `/wda/homescreen`, since `pressButton home` is a silent no-op on the iOS 26
+  bench; `lock`/`side-button` → `/wda/lock`), `siri` and `apple-pay` throw.
+  Each request carries its own timeout: WDA answers an action only once the
+  app is idle, and answers Home ~10 s late when the home screen is already in
+  front (15 s allowed). `tap-label` parses the text with `tap-label.js`'s
+  `parseTapTarget`, finds elements with a `predicate string` (`label == "…"`,
+  or `name == "…"` for `#id` — WDA has no identifier-only attribute),
+  measures each match's `/element/:id/rect` (at most 20), and
+  `pickLabelTarget` keeps the on-screen ones (WDA reports an off-screen
+  element — an icon on another home-screen page — with a zero rect, and its
+  element click "succeeds" there): none → error, several → error unless one
+  rect contains all the others, then a pointer tap at that rect's centre.
+  **Wake:** before every command `GET /wda/locked`; if locked, `POST
+  /wda/homescreen` (≈0.25 s; `/wda/unlock` times out on the bench) and check
+  again — still locked is an error. A coordinate gesture that found the device
+  locked is not dispatched (it was aimed at the lock screen) and acks
+  `{detail: "unlocked"}`; text, keys, buttons and tap-by-label run after the
+  wake.
 
   *WDA sessions.* Session-scoped calls that answer `404` / `invalid session
   id` re-create the session (re-applying the settings, which a restarted WDA
@@ -339,7 +365,9 @@ Places designed to be extended, and the contract each one implies.
   accessibility-tree read can take ~7 s while a screen is mid-transition.
   `runAxe` rejections carry AXe's raw output as `err.stderr`; a timeout or
   spawn failure has none. Unknown types throw, which surfaces as a
-  `{type:"error"}` ack rather than a silent no-op. Adding an event type means
+  `{type:"error"}` ack rather than a silent no-op — and the page toasts every
+  error ack, not only those of the controls that wait for one. The device
+  backend's mapping is in § Backends (*Input*). Adding an event type means
   adding a case (in every backend) and a client sender.
 - **Hardware buttons.** Gated by an explicit list (`BUTTONS`: `home`, `lock`,
   `side-button`, `siri`, `apple-pay`) — not passed through to AXe
@@ -628,7 +656,11 @@ in-process fake WDA (JSON API + an MJPEG server) and
 pipes its port to the fake stream: the settings mapping and clamping, role
 resolution and its refusals, the one-retry session recovery (request count
 pinned), identity/bounds/boundary, a bare multipart body through the forward,
-screenshot and the input refusal, `stop()` killing the forward, a missing WDA
+screenshot, the input mapping (points, clamping, duration caps, the keys and
+buttons a device has and the ones it refuses), FIFO order through the fake
+WDA, the wake (a gesture spent on it, text typed after it, a device that stays
+locked), tap by label (off-screen and nested matches, ambiguity, the NSPredicate
+escaping), `stop()` killing the forward, a missing WDA
 failing before any forward, go-ios's bind failure, a non-MJPEG listener
 refused at once with the child killed, the `ios info` fallback, and a
 missing `ios`.
@@ -685,8 +717,14 @@ phase gate is a browser session:
     shows `[device] selected:` with the device's name and `forward ready`;
     Chrome shows the live screen with a green dot and `MJPEG`;
     `curl -H 'x-token: <T>' …/stream` for 5 s counts ≥25 fps × 5 boundaries;
-    a reload logs no second `[mjpeg] open:`; a tap toasts "not supported
-    yet"; the screenshot control saves a device-sized PNG; the share's stream
+    a reload logs no second `[mjpeg] open:`; from Chrome a tap, a drag-swipe
+    (or ▲/▼/←/→), a long-press on a home-screen icon (context menu), pasted
+    Unicode text, Backspace and Return, Home (from an app and from an open
+    context menu), a tap by label that matches (`Search` on the home screen)
+    and one that does not (an icon on another page → "No on-screen element
+    matched"), and Siri / Esc (refused with a red toast) all behave; an
+    auto-locked device logs `locked — pressing home to unlock` on the next
+    input; the screenshot control saves a device-sized PNG; the share's stream
     ends at its deadline and its link is then `401`; after Ctrl-C
     `pgrep -f 'ios forward --udid='` finds nothing; and `--wda
     http://localhost:<unused>` exits at startup with `qa-device up primary`.

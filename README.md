@@ -109,9 +109,16 @@ The page, links, shares and tunnels work exactly as with a simulator. The
 picture is WDA's own MJPEG stream (~28 fps at the defaults), reached through
 an `ios forward` the server owns and removes on exit; `--fps`/`--scale`/
 `--quality` become WDA's stream settings, and `--fps` defaults to 30 here.
-**For now the device is view-only** — input answers "not supported yet", and
-the page shows MJPEG (H.264 from a device comes later). A WDA that does not
-answer stops the server at startup with the command that fixes it.
+Input goes through WDA: taps, long-presses and swipes, typed text (Unicode
+included), Return / Backspace / Tab / Space, the Home and Lock buttons, and
+tap by label. What a device cannot do is refused with an error toast — the
+Siri and Apple Pay buttons, Escape and the arrow keys. A device that auto-locked
+is unlocked first (bench devices have no passcode); a tap or swipe aimed at the
+lock screen is spent on that unlock. Tap by label only matches elements on
+screen, and `#id` matches WDA's `name` (the identifier, or the label when an
+element has none). The page shows MJPEG for now (H.264 from a device comes
+later). A WDA that does not answer stops the server at startup with the
+command that fixes it.
 
 ### Share links that expire
 
@@ -322,7 +329,7 @@ device (`--device`); `server.js` is target-agnostic.
 |---------------------------|----------------------------------------------------------------------|
 | `server.js`               | Node.js server: HTTP, WS endpoints, auth, wiring the hubs to the backend |
 | `backends/simulator.js`   | The simulator backend: discovery/boot, bounds, AXe capture + input, `simctl` screenshots |
-| `backends/device.js`      | The device backend: WDA session + settings, `ios forward` of WDA's MJPEG, bounds and screenshots from WDA |
+| `backends/device.js`      | The device backend: WDA session + settings, `ios forward` of WDA's MJPEG, bounds, screenshots and input through WDA |
 | `test/device-backend.test.js` | Unit tests for it against a fake WDA and `test/fixtures/fake-ios` (`npm test`; no device needed) |
 | `backends/queue.js`       | `SerialQueue`: the input FIFO every backend runs commands through   |
 | `test/simulator-backend.test.js`, `test/queue.test.js` | Unit tests for their pure parts (`npm test`; no simulator needed) |
@@ -332,7 +339,7 @@ device (`--device`); `server.js` is target-agnostic.
 | `test/h264.test.js`       | Unit tests for it (`npm test`; no simulator needed)                  |
 | `scripts/video-probe.js`  | Scripted `/video` client: frame rate, close code, saves the stream   |
 | `shares.js`               | The token registry: your token plus expiring share tokens            |
-| `tap-label.js`            | Tap by accessibility label: `axe tap` arguments, AXe's error → one line |
+| `tap-label.js`            | Tap by accessibility label: the target parser both backends share, `axe tap` arguments, AXe's error → one line |
 | `test/tap-label.test.js`  | Unit tests for it (`npm test`; no simulator needed)                  |
 | `gallery.js`              | Screenshot gallery: file names, which files may be served, thumbnails, the page |
 | `test/gallery.test.js`    | Unit tests for it (`npm test`; no simulator needed)                  |

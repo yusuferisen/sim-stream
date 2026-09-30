@@ -62,36 +62,32 @@
 - [ ] **Phase 9 — Real-device backend (WebDriverAgent)**
   - [x] 9.1 Backend seam → `backends/simulator.js` + `mjpeg.js`; checklist passed on a clone [model: fable]
   - [x] 9.2 Device video → `backends/device.js`; ~28 fps from the primary bench iPhone
-  - [ ] 9.3 Device input — tap/long-press/swipe as W3C actions, `type` via `/wda/keys`, buttons via WDA, `tap-label` via accessibility lookup; unlock before dispatch
+  - [x] 9.3 Device input → Home via `/wda/homescreen`, Siri refused (WDA has no working equivalent on the bench)
   - [ ] 9.4 H.264 for devices — helper `--input mjpeg`; `/video` from the device at ≥25 fps and a few Mbit/s
 
 ---
 
 ## Current Status
 
-- **Current phase / sub-phase:** 9.3 — device input (real-device backend, Phase 9)
+- **Current phase / sub-phase:** 9.4 — H.264 for devices (real-device backend, Phase 9)
 - **State:** not-started
-- **Last completed:** 9.2 (device video) — `--device primary` streams the bench iPhone 16e to Chrome at 27–28 fps, view-only; the 🏁 Safe public sharing milestone still awaits the owner's review before its box is ticked
-- **Build:** green (`node --check` ×10) · **Tests:** 140/140 `npm test` + 11 `swift test` · **Device-verified:** yes (9.2: primary bench iPhone — Chrome playback, reload in the grace window, input error ack, screenshot, a 40 s share expiring, no forward left after Ctrl-C, dead WDA → startup exit with `qa-device up primary`)
+- **Last completed:** 9.3 (device input) — the primary bench iPhone is drivable from Chrome (touches, text, keys, Home, tap by label, wake from auto-lock); the 🏁 Safe public sharing milestone still awaits the owner's review before its box is ticked
+- **Build:** green (`node --check` ×10) · **Tests:** 149/149 `npm test` + 11 `swift test` · **Device-verified:** yes (9.3: primary bench iPhone 16e from Chrome — tap, swipes, long-press, Unicode text, Backspace/Return, Home, label hit + miss, refusal toasts, screenshot, auto-lock wake)
 
 ---
 
 ## Next Concrete Action
 
-> Implement 9.3 (device input) in `backends/device.js`: replace the
-> "not supported yet" `input()` with a `SerialQueue` that maps tap /
-> long-press / swipe to W3C pointer actions (`POST /session/:id/actions`,
-> points = normalized × `bounds`, clamped like `axeInputArgs`), `type` via
-> `/wda/keys`, keys and buttons per `DECISIONS.md` § Phase 9 pre-flight
-> defaults (refuse the rest with an error ack), and `tap-label` via an
-> accessibility lookup (`/elements` by label, `#id` by identifier; no match /
-> several matches → error ack). Before each command check `/wda/locked` and
-> wake: `/wda/unlock` timed out on the locked 16e in 9.2 while
-> `/wda/homescreen` unlocked it. Use `WdaClient.session()` (one-retry
-> recovery). Tests against the fake WDA in `test/device-backend.test.js`.
-> Done when the browser checklist (tap, swipe, long-press, typed text, a key,
-> a button, a label tap, a screenshot) passes from Chrome on the primary bench
-> iPhone. Scope: `docs/ROADMAP.md` § Phase 9. 9.3 is untagged.
+> Implement 9.4 (H.264 for devices): give the Phase 7 helper (the Swift
+> encoder in `helper/`) an `--input mjpeg` mode — ImageIO decode of JPEG
+> frames found by SOI/EOI scan, pixel size from the first frame's SOF — and
+> make `backends/device.js`'s `h264Pipeline()` GET the forwarded MJPEG and
+> pipe the body into the helper's stdin (`h264` plan `ok: true` when the
+> helper exists). `swift test` for the new decoder pieces; `npm test` for the
+> plan/pipeline wiring against the fake WDA. Done when `/video` from the
+> primary bench iPhone plays at ≥25 fps in Chrome at a few Mbit/s, and the
+> page still falls back to MJPEG with the helper moved aside. Scope:
+> `docs/ROADMAP.md` § Phase 9. 9.4 is untagged.
 > Separately, the owner still owes a review of the 🏁 Safe public sharing
 > milestone (tick its box when satisfied).
 
@@ -100,7 +96,7 @@
 ## Open Decisions (reversible — defaults chosen, proceeding)
 
 - **Device MJPEG default rate, forward proof, no forward respawn (9.2)** → chose **30 fps; prove WDA's MJPEG answers before listening; a dead forward means restart** → DECISIONS.md § Device video mechanics (phase 9)
-- **Special keys and hardware buttons on a device (9.3)** → chose **map what WDA has (return/delete/tab/space; home, lock=side-button, siri), refuse the rest with an error ack** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
+- **Device keys, buttons, wake and tap by label (9.3)** → chose **Home = `/wda/homescreen`, Siri refused, wake by home-screen press, a gesture on a locked device spent on the wake, on-screen label matches only (nested ones count once), every error ack toasted** → DECISIONS.md § Device input mechanics (9.3, reversible)
 - **Helper JPEG input (9.4)** → chose **ImageIO decode, frames found by SOI/EOI scan, size from the first SOF; the server fetches the MJPEG and pipes it to the helper's stdin** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
 
 ---
@@ -113,7 +109,7 @@
 
 ## Assumptions & Risks
 
-- **Automated tests cover only the import-safe modules** (`npm test`: `shares.js`, the token registry; `h264.js` and `mjpeg.js`, the two hubs' logic; `gallery.js`, the gallery's serving rules; `tap-label.js`, tap-by-label arguments and error text; `remote.js`'s `cloudflared` provider, against a fake binary; `backends/queue.js` and the pure parts of `backends/simulator.js` — selection, bounds, input → `axe` argv, the preamble stripper; `backends/device.js` against a fake WDA and a fake `ios`). The process plumbing the backend spawns (AXe, `simctl`, the encoder) needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is still the manual checklist in `docs/architecture.md` § Testing strategy.
+- **Automated tests cover only the import-safe modules** (`npm test`: shares, both hubs, gallery, tap-label, the `cloudflared` provider, the queue, the simulator backend's pure parts, the device backend against a fake WDA and `ios`). Process plumbing (AXe, `simctl`, the encoder, a real WDA) needs a simulator or bench device, so nothing runs in CI; the phase gate is the manual checklist in `docs/architecture.md` § Testing strategy.
 - **`boundsForDeviceType()` (in `backends/simulator.js`) is a hand-maintained table.** A simulator model missing from it mis-maps taps silently — check `/api/info` bounds first when taps land wrong.
 - **H.264 can silently turn off on a cold boot.** The startup probe screenshot has a 10 s timeout; a freshly booted clone exceeded it once in 9.1 (the backend seam) and the run said `MJPEG only — … screenshot timed out`. Restart once the simulator settles (a probe retry would fix it; pre-existing, seen once).
 - **The operator's own token never expires** within a run (the `local:` / `--remote` banner links). Hand out `--share` links, not the top one.
@@ -127,6 +123,7 @@
 - **Neither hub has a heartbeat** — a hung capture stays `live`. The page copes (falls back after 4 s without frames); a script client must do the same.
 - **go-ios binds the device's MJPEG forward on all interfaces** (no bind-address option) — anyone on the LAN who finds the port sees the device's screen without a token while a device server runs, as the bench's WDA forwards already allow full control. Keep device runs on trusted networks.
 - **Device mode (Phase 9) is bench-only:** WDA must already be running (`qa-device up <role>`), `ios` (go-ios) is required for the port-forward, and the tool cannot tell a bench device from a personal one — the bench rule is the guard. Keep device shares short.
+- **Device input is slow (9.3):** ~1 s per touch (WDA waits for idle); Home on the home screen answers ~10 s late, holding the queue; Lock times out without locking on the iOS 26.6 bench.
 - **The QuickTime-mirror capture route is unavailable on this Mac** (macOS 27 / iOS 26.6: no AVFoundation muxed device appears even when enabled), so 60 fps over USB is not on the table; WDA's 29 fps MJPEG is the ceiling for devices.
 - **Phase 8b needs the owner's ngrok account** (authtoken in the Keychain as `NGROK_AUTHTOKEN`). A run reaching it should halt.
 - **Quick tunnels have no uptime guarantee** (one 6.1 run lost every tunnel connection at ~111 s, unexplained). A share meant to last hours may be better on Tailscale Funnel.

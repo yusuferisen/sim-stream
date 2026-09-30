@@ -772,6 +772,8 @@ cheap to change.
   → `/wda/siri/activate`; `screenshot` unchanged; `apple-pay` refused with an
   error ack (no WDA equivalent). Volume buttons exist in WDA but not in the
   client — not exposed in Phase 9.
+  *(Amended in 9.3: home → `/wda/homescreen`, siri refused — § Device input
+  mechanics.)*
 - **Helper JPEG input:** decode with ImageIO (simplest, fast enough at ½
   scale), locate frames by scanning for JPEG SOI/EOI markers so the helper
   does not care about multipart headers, and take the pixel size from the
@@ -808,3 +810,55 @@ Small calls made while building the device backend. Each is cheap to change.
 **Rejected:** hardcoding WDA's boundary (it would silently break on a WDA that
 changes it); polling a non-MJPEG answer until the timeout (it cannot become
 WDA's stream).
+
+---
+
+## 2026-09-30 — Device input mechanics (9.3, reversible)
+
+Calls made while wiring input to WDA on the primary bench iPhone 16e (iOS
+26.6.2, WDA 16.12.3). Each is cheap to change. Two amend the pre-flight
+defaults above, because the device answered differently than planned.
+
+- **Home is `/wda/homescreen`, not `pressButton home`.** `pressButton home`
+  answers success in 0.5 s and does nothing — from an app or from the home
+  screen. `/wda/homescreen` works (0.1 s from an app), but with the home
+  screen already in front it answers only after ~10 s and WDA runs nothing
+  else meanwhile, so Home gets a 15 s timeout and the queue waits. Accepted:
+  Home on the home screen is rare, and its effect (closing a menu) lands at
+  once.
+- **Siri is refused** (amends the pre-flight default). `/wda/siri/activate`
+  with no text is a silent no-op; it only starts Siri *with a typed request*,
+  which the button does not have. A refusal beats an ack that did nothing.
+- **Lock stays `/wda/lock`**, although on this bench it times out ("Timed out
+  while waiting until the screen gets locked") and the screen stays on. Other
+  bench devices or WDA versions may lock; the failure surfaces as WDA's error
+  toast after ~10 s.
+- **Wake = `/wda/homescreen`, checked by `/wda/locked`, before every
+  command.** `/wda/unlock` times out after 8 s on the bench; a home-screen
+  press unlocks a passcode-free device in 0.25 s. One `GET /wda/locked` per
+  command is cheap next to WDA's ~1 s per touch.
+- **A tap, long-press or swipe that finds the device locked is spent on the
+  wake**, not dispatched: the viewer aimed it at the lock-screen picture, and
+  after the unlock the same point is on a different screen. Text, keys,
+  buttons and tap by label run after the wake — they do not aim at a point.
+- **Tap by label: a WDA lookup, then a pointer tap at the match's centre.**
+  WDA's element click reports success on an element that is off screen (an
+  icon on another home-screen page), so each match's rect is measured and only
+  on-screen ones count (off-screen ones come back as a zero rect; WDA's
+  `visible` attribute excluded on-screen icons too, so it is not used).
+  Several on-screen matches are refused, like AXe, unless one contains all the
+  others — a control and its own icon and text share the label (the home
+  screen's Search pill matches three times). `#id` matches WDA's `name`,
+  which is the identifier or, failing that, the label: WDA exposes no
+  identifier-only attribute.
+- **Special keys: `backspace` → `\b`, not `delete`.** The client sends
+  `backspace`; the simulator's `delete` is *forward* delete (HID 76), which
+  WDA cannot type, so it is refused with escape and the arrows.
+- **The page toasts every error ack**, not only those of controls that asked
+  for one (screenshot, tap by label). Before, a refused tap or key went to the
+  console only; a device refuses more, and the roadmap asks for error toasts.
+
+**Rejected:** `pressButton home` (a no-op here); `/wda/unlock` (times out);
+WDA's element click for tap by label (off-screen "success"); the `visible ==
+1` predicate (drops elements that are on screen); retrying a gesture after the
+wake (it would land on whatever the unlock revealed).

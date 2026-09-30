@@ -319,3 +319,25 @@ with `qa-device up primary`. Gotchas: WDA's boundary header is
 on all interfaces; `POST /wda/unlock` timed out on the locked 16e while
 `/wda/homescreen` woke and unlocked it — relevant for 9.3 (device input).
 `npm test` 140/140 (14 new in `test/device-backend.test.js`).
+
+## 2026-09-30 — 9.3 (device input — the bench iPhone is drivable from the browser)
+
+`backends/device.js` now takes input through WDA, one command at a time
+(`SerialQueue`): taps, long-presses and swipes as W3C touch actions in points;
+text (Unicode) and Return/Backspace/Tab/Space through `/wda/keys`; Home via
+`/wda/homescreen`, Lock via `/wda/lock`; Siri, Apple Pay, Escape and arrows
+refused. Tap by label is a predicate lookup, each match's rect measured, a
+tap at the chosen on-screen centre. Before every command `/wda/locked` is
+checked and a locked device is woken with a home-screen press; a gesture that
+found it locked is spent on the wake. `tap-label.js` gained `parseTapTarget`
+(shared by both backends); the page now toasts every error ack. Verified from
+Chrome on the primary iPhone 16e: coordinate tap, ▲/← swipes, long-press
+(context menu), " café" + Backspace + Space, Return (Spotlight → Calculator),
+Home from an app and from a menu, tap by label hit (`Settings`, `Search`) and
+miss (off-page icon), Siri/Esc refusal toasts, screenshot, auto-lock wake.
+Gotchas: `pressButton home` and `/wda/siri/activate` without text are silent
+no-ops; `/wda/homescreen` answers ~10 s late when the home screen is already
+in front; `/wda/lock` times out and does not lock on iOS 26.6; WDA's element
+click "succeeds" on off-screen elements and `visible == 1` drops on-screen
+ones; ~1 s per touch (WDA waits for idle), one swipe over 10 s mid-animation.
+`npm test` 149/149 (9 new), `swift test` 11/11.

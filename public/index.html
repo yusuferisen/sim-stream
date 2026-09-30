@@ -615,7 +615,9 @@
       } else if (msg.type === "error") {
         const cb = pendingAcks.get(msg.id);
         if (cb) { pendingAcks.delete(msg.id); cb.onError?.(msg); }
-        else console.warn("[input]", msg.message);
+        // Every refused input says why (a device refuses keys and buttons it
+        // cannot press) — never just the console.
+        else toast(msg.message, "bad");
       }
     };
   }
