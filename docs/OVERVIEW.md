@@ -150,8 +150,8 @@ so they can be chained.
 
 Known and accepted, not defects:
 
-- **~7–10 fps.** AXe's capture is a screenshot loop, so the `--fps` flag is an
-  upper bound it won't reach. Fine for verifying layout and placement; not
+- **~7–10 fps.** That is what AXe's MJPEG mode delivers, so the `--fps` flag is
+  an upper bound it won't reach. Fine for verifying layout and placement; not
   enough for judging animation or scroll feel.
 - **US keyboard only.** AXe's `type` uses HID keycodes — no accented or
   non-ASCII characters.

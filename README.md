@@ -244,9 +244,12 @@ at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
 
 ## Limitations
 
-- **Capture rate caps at ~7–10 fps.** AXe's `stream-video` is
-  screenshot-based. For smoother video you'd need a ScreenCaptureKit +
-  VideoToolbox pipeline feeding WebRTC — out of scope here.
+- **Capture rate caps at ~7–10 fps.** That is the ceiling of AXe's MJPEG
+  mode, which this server uses, whatever `--fps` asks for. (AXe's raw-frame
+  mode reaches 30 fps, but needs an encoder the server doesn't have.)
+- **`--scale 1.0` is very heavy.** At full scale AXe's MJPEG mode sends
+  ~3.6 MB PNG frames — roughly 30 MB/s. Stay at the default `0.5` unless
+  you're on the same machine.
 - **US keyboard only.** AXe's `type` command uses HID keycodes, so
   accented / non-ASCII characters aren't supported.
 - **Single-touch.** Multi-finger gestures (pinch, rotate) aren't wired up.

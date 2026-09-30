@@ -50,13 +50,15 @@
 - [ ] 🏁 **MILESTONE: Safe public sharing** ← default stop point
 - [ ] **Phase 6b — Gated public sharing (Cloudflare Access)**
   - [ ] 6b.1 `cloudflare-access` named-tunnel provider — Access policy in front of the tunnel
-- [ ] **Phase 7 — Capture pipeline**
-  - [ ] 7.1 Swift helper — ScreenCaptureKit capture + VideoToolbox H.264 encode
-  - [ ] 7.2 WebRTC transport replacing the MJPEG path
+- [ ] **Phase 7 — Capture pipeline (30 fps H.264)**
+  - [ ] 7.1 Swift encoder helper — raw BGRA on stdin (from `axe stream-video --format bgra`) → VideoToolbox H.264 on stdout; done when an AXe→helper pipe yields a stream `ffprobe` reads at ≥25 fps
+  - [ ] 7.2 H.264 hub + authenticated `/video` WebSocket — refcount/grace/generation like `MjpegHub`, keyframe-on-join, slow-client drop, share-expiry `track()`; MJPEG untouched [model: fable]
+  - [ ] 7.3 Browser player — WebCodecs → canvas on secure contexts, automatic MJPEG fallback elsewhere; taps still land and ack inside the queue timeout
 - [ ] **Phase 8 — Borrowed conveniences**
-  - [ ] 8.1 Screenshot gallery — `~/Desktop/sim-stream/` plus a served thumbnail index
-  - [ ] 8.2 Tap by accessibility label — resolve a label to coordinates via `axe`
-  - [ ] 8.3 `ngrok` provider
+  - [ ] 8.1 Screenshot gallery — screenshots land in `~/Desktop/sim-stream/`; owner-only `/gallery` index with `sips` thumbnails
+  - [ ] 8.2 Tap by accessibility label — a `tap-label` input event passed to `axe tap --label` through the command queue
+- [ ] **Phase 8b — `ngrok` provider (needs the owner's ngrok account)**
+  - [ ] 8b.1 `ngrok` provider — same provider shape as 6.1; authtoken from the environment, never a repo file
 
 ---
 
@@ -87,12 +89,14 @@
 ## Open Decisions (reversible — defaults chosen, proceeding)
 
 - **Missing `cloudflared` binary in 6.1** → chose **fail immediately with the install command**, mirroring `start.sh`'s `axe` check → DECISIONS.md § Phase 6.2 deferred (phase 6)
-- **When is ~7–10 fps no longer good enough to justify Phase 7?** → chose **defer until animation or scroll review actually blocks a check** → DECISIONS.md § Build vs. adopt (phase 7)
+- **Encoder for 7.1 (Swift encoder helper)** → chose **Swift/VideoToolbox, not `ffmpeg`** → DECISIONS.md § Phase 7–8 defaults (phase 7)
+- **Helper not built, or no `swift`** → chose **serve MJPEG as today, one log line; `start.sh` builds it when it can** → DECISIONS.md § Phase 7–8 defaults (phase 7)
+- **H.264 stream shape (7.1)** → chose **30 fps, size follows `--scale`, keyframe every second, no B-frames** → DECISIONS.md § Phase 7–8 defaults (phase 7)
+- **Who may open the screenshot gallery (8.1)** → chose **owner credential only; share links refused** → DECISIONS.md § Phase 7–8 defaults (phase 8)
+- **Gallery thumbnails (8.1)** → chose **`sips`, cached in `~/Desktop/sim-stream/.thumbs/`; old Desktop screenshots not migrated** → DECISIONS.md § Phase 7–8 defaults (phase 8)
+- **Tap-by-label matching (8.2)** → chose **label text, `#name` for an identifier; AXe's own error on no/multiple matches, never a guess** → DECISIONS.md § Phase 7–8 defaults (phase 8)
 - **Does a screenshot gallery stay local or sync across devices?** → chose **local filesystem only** → DECISIONS.md § Build vs. adopt (phase 8)
 - **Multi-simulator support** → chose **out of scope; one simulator per server** → DECISIONS.md § Build vs. adopt
-- **Share lifetime syntax (5.2, expiring share links)** → chose **`--share [label=]<ttl>` with a mandatory unit; a bare number is an error** → DECISIONS.md § Share-token mechanics (5.2)
-- **A dead link token vs. a still-valid cookie (5.2)** → chose **the link decides: `401`, even in the operator's own browser** (amends 5.1, cookie handoff) → DECISIONS.md § Share-token mechanics (5.2)
-- **Revoking or extending one share (5.2)** → chose **not supported; restart revokes everything, the operator's own never-expiring token included** → DECISIONS.md § Share-token mechanics (5.2)
 
 ---
 
@@ -105,6 +109,10 @@ hosted-infrastructure scope line were amended, and the PRD is now frozen.
 Phase 6b's Cloudflare-domain prerequisite is tracked under Assumptions & Risks
 rather than here — it blocks a post-milestone phase, not the run.
 
+`/clarify` pre-flighted Phases 7–8 on 2026-09-30 (four owner decisions of that
+date in `DECISIONS.md`): they need nothing from the owner. Phase 8b's ngrok
+account is tracked under Assumptions & Risks, like 6b's domain.
+
 ---
 
 ## Assumptions & Risks
@@ -114,8 +122,12 @@ rather than here — it blocks a post-milestone phase, not the run.
 - **`boundsForDeviceType()` is a hand-maintained table.** A simulator model missing from it mis-maps taps silently — check `/api/info` bounds first when taps land wrong.
 - **The operator's own token still never expires** within a run, and it is the one on the `local:` / `--remote` banner lines. Only `--share` links die on their own — hand those out, not the top link.
 - **Tailscale providers were not re-run after 5.2 (expiring share links) changed the provider contract** (`start` now returns a token-free URL). `lan` was verified from a real phone and the Tailscale edit is the same one-line shape, but check the printed links on the next `tailscale-serve`/`-funnel` use.
-- **The iOS 27 sandbox clone is slow while streaming:** `axe tap` timed out there in 5.1 (cookie handoff) verification (~10 s vs. the queue's 5 s) and `simctl io screenshot` in 5.2 (expiring share links) verification (past its 10 s); hardware buttons ack fine. Environmental and older than both phases — recheck on the home phone before blaming the queue.
-- **Cloudflare's edge may buffer `multipart/x-mixed-replace`.** Test an actual tunnel before recommending either Phase 6 provider over Tailscale.
+- **An iOS 27 sandbox clone was slow while streaming** in Phase 5 verification (`axe tap` ~10 s, screenshot past 10 s); not reproduced on a fresh clone on 2026-09-30 (1.6–2.0 s, 0.5 s). Environmental — recheck before blaming the queue.
+- **Phase 7's 30 fps rests on one measurement** (raw `bgra` 28.6–30.4 fps vs. 7–9.5 for `mjpeg`; static screen, headless clone). AXe caps `--fps` at 30 — this design's ceiling → DECISIONS.md § Phase 7 capture source.
+- **30 fps capture slows taps:** 3.0–3.5 s vs. 1.6–2.0 s, against the queue's 5 s timeout. 7.3 (browser player) must re-measure; input wins over smoothness (PRD principle 5).
+- **The H.264 path only runs on https or `localhost`**, so plain-http `--remote lan` stays on MJPEG by design. Phase 7 runs before 6.1 (the account-free https tunnel), so 7.3 verifies H.264 in desktop Chrome on `localhost` and the MJPEG fallback from a phone over `lan`; the real-iPhone H.264 check waits for 6.1 (not blocking — record it as outstanding, don't halt on it).
+- **Phase 8b needs the owner's ngrok account** (`ngrok` not installed; authtoken in the Keychain as `NGROK_AUTHTOKEN`). A run reaching 8b should halt.
+- **Cloudflare's edge may buffer `multipart/x-mixed-replace`.** Test an actual tunnel before recommending either Phase 6 provider over Tailscale. `cloudflared` is not installed on this host yet (`brew install cloudflared`; no account needed).
 - **`docs/OVERVIEW.md` and `docs/architecture.md` were inferred by `/adopt` on 2026-07-31** from the code — their claims were source-verified in review, but they describe intent they weren't written from.
 - **Phase 6b needs a domain on a Cloudflare account** (plus a named tunnel and an Access policy) before it can be built or verified. It sits past the milestone for exactly this reason; a run reaching it should halt.
 

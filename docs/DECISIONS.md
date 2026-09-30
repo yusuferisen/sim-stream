@@ -349,3 +349,144 @@ dead link token (see above); `--share` silently ignored under `--auth false`
 **Cost accepted:** no per-share revocation and no extension — restart is the
 only lever, and it revokes the operator's link too. A stale bookmark carrying
 an old `?token=` now gets `401` even if the browser still has a good cookie.
+
+---
+
+## 2026-09-30 — Phase 7 capture source: AXe raw frames, not ScreenCaptureKit
+
+**Chose:** Phase 7 takes its frames from `axe stream-video --format bgra
+--fps 30` and encodes them in a Swift/VideoToolbox helper. ScreenCaptureKit is
+dropped from the phase. Settled with the owner in the Phase 7–8 pre-flight.
+
+**Why:** the premise behind the original plan — "AXe's capture is a screenshot
+loop capped at ~7–10 fps" (the 2026-04-24 AXe entry above) — turned out to be
+true only of AXe's `mjpeg` mode. Measured on AXe 1.8.0, iOS 27, a headless
+sandbox clone showing a static home screen, 6–8 s per run:
+
+| Mode | Requested | Scale | Delivered |
+|---|---|---|---|
+| `mjpeg` | 10 fps | 1.0 | 8.8 fps (frames are ~3.6 MB PNGs labelled `image/jpeg`) |
+| `mjpeg` | 30 fps | 1.0 | 9.5 fps |
+| `mjpeg` | 30 fps | 0.5, quality 60 | 7.1 fps |
+| `bgra` | 30 fps | 1.0 (1206×2622) | 30.4 fps |
+| `bgra` | 30 fps | 0.5 (603×1311) | 28.6 fps |
+
+So capture was never the bottleneck; the JPEG path is. And ScreenCaptureKit
+does not fit this host at all: it captures a **visible Simulator.app window**,
+and at the time of measurement Simulator.app was not running while seven
+simulators were booted headless — which is how agents run them here. It would
+also need a Screen Recording grant for whichever app launches the server, and
+cropping of the window chrome and bezel before taps map correctly.
+
+**Cost accepted:** AXe caps `--fps` at 30, so 30 fps is this design's ceiling
+where ScreenCaptureKit could reach 60. `axe tap` also slowed from 1.6–2.0 s to
+3.0–3.5 s while the raw stream ran — inside the queue's 5 s timeout, but to be
+re-measured when the player lands.
+
+**Rejected:** ScreenCaptureKit as written (cannot see headless simulators);
+both sources at once (a second capture path to maintain before 30 fps has been
+shown to be too little — add it as a lettered phase if that day comes).
+
+**Also closes** the open question "when is ~7–10 fps no longer good enough to
+justify Phase 7?" — the owner asked for the phase, and it is far cheaper than
+the rewrite that question was guarding against.
+
+---
+
+## 2026-09-30 — Phase 7 transport: H.264 over WebSocket + WebCodecs; MJPEG stays
+
+**Chose:** H.264 access units sent as binary messages on an authenticated
+`/video` WebSocket and decoded in the browser with WebCodecs (`VideoDecoder` →
+`<canvas>`). MJPEG is **kept** as the default-capable fallback rather than
+replaced. Supersedes the WebRTC half of the 2026-04-24 MJPEG entry's "revisit
+together with Phase 7". Settled with the owner in the pre-flight.
+
+**Why:**
+- **It travels wherever the page travels.** A WebSocket rides every route the
+  tool already has, including the HTTP-only public tunnels. WebRTC media is
+  UDP between peers: through Funnel, a Cloudflare tunnel or ngrok it needs a
+  TURN relay, which is hosted infrastructure on the viewing path (PRD
+  principle 3).
+- **No new dependency.** The decoder is in the browser; the encoder is
+  VideoToolbox. A WebRTC stack is a large library in either the helper or the
+  server, in a project whose production dependencies are `express` and `ws`.
+- **It reuses the auth and expiry machinery as-is** — `requestAuthorized()` at
+  the upgrade, `ShareRegistry.track()` on the socket.
+
+**Cost accepted:** browsers expose `VideoDecoder` only on secure contexts, so
+a plain-http `--remote lan` link stays on MJPEG. `localhost`, Tailscale Serve
+and Funnel, and the Cloudflare tunnel are https and get the H.264 path.
+
+**Rejected:** WebRTC (above); fragmented MP4 into Media Source Extensions
+(would also cover plain-http LAN, but adds a muxer, live-edge chasing and
+roughly 0.2 s of delay, and is the most finicky of the three on iPhone Safari
+— the likeliest to need a second pass in an unattended run); removing MJPEG
+(it is what keeps `npm i && node server.js` a complete tool with no build).
+
+---
+
+## 2026-09-30 — `ngrok` provider parked as Phase 8b
+
+**Chose:** the `ngrok` provider leaves Phase 8 and becomes **Phase 8b**, gated
+on the owner's ngrok account — the same treatment, and the same lettering
+rule, as Phase 6b.
+
+**Why:** `ngrok` is not installed on the host and every ngrok tunnel now
+requires an account and an authtoken, so the item cannot be verified
+unattended; an unverifiable item must not sit inside a phase meant to run
+without the owner. Its stated purpose — a one-off share without a Cloudflare
+account — is already met by the Phase 6 quick tunnel, which needs no account.
+
+**Carries an obligation:** the authtoken is a secret. It lives in the login
+Keychain and reaches the provider as `NGROK_AUTHTOKEN`; the provider must not
+write it to a repo file or to ngrok's config file.
+
+**Rejected:** dropping the item (the owner kept it) and leaving it in Phase 8
+(a guaranteed halt at the end of the run).
+
+---
+
+## 2026-09-30 — 7.2 tagged `[model: fable]`; the rest of Phases 7–8 untagged
+
+**Chose:** tag only 7.2 (the H.264 hub and `/video` endpoint).
+
+**Why:** same reasoning as the 5.2 tag — it is the slice that fails
+**silently**. `/video` is a new long-lived entry point: a missed auth check is
+an open door, a missed `track()` lets an expired share keep watching, and the
+hub's refcount/generation guards are concurrency invariants that break without
+throwing. 7.1 fails loudly (`ffprobe` reads 30 fps or it doesn't), 7.3 fails
+visibly in the browser, and Phase 8 is small additive work.
+
+**Cost accepted:** one sub-phase draws the capped Fable share of the plan.
+(The 5.2 entry's "billed at API pricing" is out of date: Fable has been inside
+the plan, capped, since 2026-08.)
+
+**Rejected:** tagging all of Phase 7, and tagging nothing.
+
+---
+
+## 2026-09-30 — Phase 7–8 defaults (reversible, chosen in the pre-flight)
+
+Logged so the run does not stop to ask. Each is cheap to change later.
+
+- **Swift/VideoToolbox helper rather than `ffmpeg`** for the encode. Any host
+  with simulators has the Xcode toolchain; `ffmpeg` would be a third required
+  binary. `ffmpeg`/`ffprobe` remain fine as *verification* tools.
+- **The helper is optional.** Not built, or no `swift`: the server serves MJPEG
+  exactly as today with one log line. `start.sh` builds it when `swift` is on
+  PATH. This is what keeps PRD principle 1 intact. 7.1 ships the package and
+  `npm run build:helper`; 7.2 owns the `start.sh` step and the server's
+  startup check.
+- **Stream shape:** 30 fps, size following the existing `--scale` flag, a
+  keyframe every second, no B-frames. One second bounds a joiner's wait even
+  without the hub's cache.
+- **Gallery is owner-only.** A share link lets someone drive the simulator for
+  a while; it should not also expose every screenshot taken before it existed.
+  Under `--auth false` there is no owner credential, so the gallery is open
+  like every other route.
+- **Thumbnails via `sips`**, cached under `~/Desktop/sim-stream/.thumbs/`.
+  Existing `~/Desktop/sim-stream-*.png` files are left where they are.
+- **Tap-by-label passes through to `axe tap --label`** (`#name` → `--id`)
+  instead of resolving coordinates in the server: AXe 1.8.0 does the lookup,
+  taps the element's activation point, and reports "no match" and "multiple
+  matches" itself. Those errors are shown, never resolved by guessing.
