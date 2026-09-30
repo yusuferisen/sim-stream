@@ -19,6 +19,7 @@ process.
 | `server.js` | Everything server-side: arg parsing, simulator discovery/boot, the auth check sites, HTTP routes, both WebSocket endpoints, the MJPEG hub, spawning the H.264 capture pipeline, the AXe command queue, input translation, shutdown. |
 | `h264.js` | The H.264 path's logic (§ H.264 video path): the capture plan, the helper-record parser, the group-of-pictures cache, and `H264Hub` — refcount, grace window, generation guard and per-viewer delivery. Pure, like `shares.js`: the pipeline, the sockets, the clock and the timers are handed in, so it is unit-testable without a simulator. |
 | `shares.js` | The credential registry (`ShareRegistry`): the owner token plus expiring share tokens, constant-time matching, the definition of expiry, and the tracking that ends long-lived connections when a share dies. Pure — no I/O, no side effects at import, clocks injectable — so it is unit-testable without a simulator. Also exports `parseTtl` / `parseShareSpec`. |
+| `gallery.js` | The screenshot gallery's rules (§ Screenshot gallery): the folder and file names, which names may be served (matched against the directory listing), the `sips` thumbnail cache, and the `/gallery` page. Import-safe; `sips` is handed in. |
 | `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`. Knows nothing about streaming or input. |
 | `public/index.html` | The entire client — markup, styles, and script in one file: the H.264 player (WebCodecs → `<canvas>`), the MJPEG `<img>` it falls back to, the input layer. Served with one templated substitution. |
 | `helper/` | **Optional** SwiftPM package: `sim-stream-encoder`, raw BGRA frames on stdin → VideoToolbox H.264 on stdout. Built by `npm run build:helper` (or by `start.sh`); nothing requires it (§ H.264 encoder helper). Its pure logic (`EncoderCore`: arguments, AXe's frame layout, output framing) has a `swift test` target. |
@@ -33,7 +34,9 @@ process.
 - **External binaries:** `axe` (capture + HID injection) and `xcrun simctl`
   (device enumeration, boot, screenshots). Both must exist on the host; neither
   is installable in CI, which is why there is no CI. `swift` (the Xcode
-  toolchain) is needed only to build the optional encoder helper.
+  toolchain) is needed only to build the optional encoder helper. `sips`
+  (built into macOS) makes the gallery's thumbnails; without it the gallery
+  shows full images.
 - **No network service on the default path.** Running the tool requires no
   account, no hosted backend, no auth provider, and no storage — it works
   offline and air-gapped. The shipped Tailscale providers (and Cloudflare
@@ -94,8 +97,21 @@ if nothing throws.
   only the server knows logical points. `dispatchInput`'s `pt()` clamps to
   `[0,1]` before scaling by `bounds`, so a malformed or out-of-range event
   cannot produce an off-screen coordinate.
+- **The gallery answers only to the owner.** `/gallery` and its file and
+  thumbnail routes pass `authCheck` and then `ownerOnly`: a share link is `403`
+  there, and `/api/info`'s `gallery` flag (which shows the page's link) is
+  false for it. With `--auth false` there is no owner to tell apart, so it is
+  open like every other route.
+- **A gallery request names a file, never a path.** The bare name must be a
+  plain `.png` name *and* one of the regular files (not symlinks) in the
+  directory listing; the path is built from the listed name. Anything else —
+  `..`, an encoded `/`, a dot-file, `.thumbs/…`, a symlink — is `404`.
+- **No stack trace leaves the server.** A final Express error handler answers
+  plain `Bad request` / `Internal error`: route parameters are decoded before
+  `authCheck` runs, so Express's default error page would show a malformed one
+  (`/gallery/file/%E0%A4%A.png`) with server paths to anyone.
 - **Auth is checked at two sites through one function.** Every HTTP route
-  (`/`, `/api/info`, `/stream`) goes through the `authCheck` middleware; both
+  (`/`, `/api/info`, `/stream`, `/gallery…`) goes through the `authCheck` middleware; both
   WebSocket endpoints (`/ws`, `/video`) are checked in the single
   `server.on("upgrade")` handler before `handleUpgrade` — path, then
   credential (`401`), then whether `/video` exists at all (`404` without the
@@ -150,7 +166,8 @@ if nothing throws.
   mostly drained — skipped forward, never queued for without bound — and one
   that stays behind for 10 s is closed, so a vanished peer cannot keep the
   capture pipeline running.
-- **The token leaves the URL on page load.** An authorized `GET /` whose URL
+- **The token leaves the URL on page load.** An authorized `GET /` (or
+  `GET /gallery`, through the same `cookieHandoff` middleware) whose URL
   still carries `token` responds `302` to the same URL minus that parameter,
   with `Set-Cookie: sim_stream_<PORT>=…; HttpOnly; SameSite=Lax; Path=/`
   (`Secure` when the request arrived over https, directly or via
@@ -349,6 +366,27 @@ a byte stream with no markers cannot be resynchronised. The group-of-pictures
 cache empties itself if keyframes stop coming (150 frames / 32 MiB) rather
 than grow.
 
+## Screenshot gallery (`gallery.js`, `/gallery`)
+
+**Where screenshots go.** The screenshot control writes
+`~/Desktop/sim-stream/sim-stream-YYYY-MM-DD-HHMMSS-mmm.png` (local time; the
+folder is created on first use). Screenshots from before the gallery existed
+(`~/Desktop/sim-stream-*.png`) are not moved.
+
+**Routes** (all `authCheck` + `ownerOnly`, read-only — there is no delete or
+rename):
+
+| Route | Answers |
+|---|---|
+| `GET /gallery` | The page: the listing newest first (mtime, then name), each a thumbnail linking to the full image. `no-store`. |
+| `GET /gallery/file/:name` | The PNG, if `name` is listed; `404` otherwise. |
+| `GET /gallery/thumb/:name` | A JPEG thumbnail (longest edge 360 px) from `sips`, cached as `.thumbs/<name>.jpg` and reused while newer than the original. If `sips` fails, the full PNG instead. |
+
+**Thumbnail cache (`ThumbCache`).** Generated on first request into a temp
+name and renamed into place, so a half-written file is never served;
+concurrent requests for one name share one `sips` run. Thumbnails of deleted
+screenshots are left behind — the folder is the owner's to tidy.
+
 ## Browser player (`public/index.html`)
 
 **Which surface.** The page picks once, after `/api/info`: H.264 when
@@ -425,7 +463,7 @@ parsing, AXe's frame layout (pinned to measured frame sizes), and the output
 framing. The VideoToolbox path itself is verified by piping a live AXe stream
 through the binary (§ H.264 encoder helper, *Measured*).
 
-**`npm test`** (`node --test`, no dependencies) covers the two modules that
+**`npm test`** (`node --test`, no dependencies) covers the three modules that
 need no simulator. `shares.js` — TTL and `--share` parsing, token matching,
 the expiry boundary, the two-clock and latch rules, session tracking, and the
 expiry timer. Anything that changes how a token is accepted or when it dies
@@ -436,6 +474,12 @@ group-of-pictures cache, and the hub on a fake pipeline, fake viewers and a
 hand-cranked clock: refcount and grace window, the generation guard, what a
 joining or lagging viewer is sent, and what happens when the pipeline dies.
 The hub's rules fail silently too, so a change to them belongs there first.
+`gallery.js` — screenshot names, the listing (order, symlinks and dot-files
+excluded), what a requested name may resolve to (traversal, encoded
+separators, the thumbnail folder), the thumbnail cache (reuse, staleness,
+one generation for concurrent requests, clean failure) and the page's
+escaping. Serving rules fail open silently, so a change to them belongs there
+first.
 
 Everything else has **no automated coverage**, and the reason is structural:
 every other meaningful path requires a booted iOS Simulator plus the AXe binary
@@ -473,6 +517,11 @@ phase gate is a browser session:
    switch to `MJPEG` once, with a single `[video] connected` in the log;
    freeze it (`pkill -STOP …`) and it must switch within ~5 s. Open the
    `--remote lan` URL (plain http) and it must show `MJPEG` from the start.
+10. If touching the gallery: take a screenshot, then open **Screenshot
+    gallery ↗** — the new shot is first, with a thumbnail. With a `--share`
+    link the gallery link is absent and `/gallery` answers `403`;
+    `curl -H 'x-token: <owner>' …/gallery/file/..%2F..%2Fx.png` must be `404`
+    and an unauthenticated `…/gallery/file/%E0%A4%A.png` a plain-text `400`.
 
 The rest of what *can* be unit-tested without a simulator — `parseArgs`, `pt()`
 clamping, `boundsForDeviceType`, provider selection — still lives in

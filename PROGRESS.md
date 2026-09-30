@@ -55,7 +55,7 @@
   - [x] 7.2 H.264 hub + authenticated `/video` WebSocket → the hub lives in the pure `h264.js`; two crash paths in the shared WebSocket entry were closed on the way [model: fable]
   - [x] 7.3 Browser player → also fixed taps that acked but never landed on iOS 27 (`--tap-style physical`)
 - [ ] **Phase 8 — Borrowed conveniences**
-  - [ ] 8.1 Screenshot gallery — screenshots land in `~/Desktop/sim-stream/`; owner-only `/gallery` index with `sips` thumbnails
+  - [x] 8.1 Screenshot gallery
   - [ ] 8.2 Tap by accessibility label — a `tap-label` input event passed to `axe tap --label` through the command queue
 - [ ] **Phase 8b — `ngrok` provider (needs the owner's ngrok account)**
   - [ ] 8b.1 `ngrok` provider — same provider shape as 6.1; authtoken from the environment, never a repo file
@@ -64,31 +64,30 @@
 
 ## Current Status
 
-- **Current phase / sub-phase:** 8.1 — Screenshot gallery
+- **Current phase / sub-phase:** 8.2 — Tap by accessibility label
 - **State:** not-started
-- **Last completed:** 7.3 (browser player — the page plays H.264 at 30 fps on https/`localhost`, MJPEG otherwise; Phase 7, the capture pipeline, is done)
-- **Build:** green (`node --check` ×4 + the page's script) · **Tests:** 59/59 `npm test` + 11 `swift test` (helper; untouched) · **Simulator-verified:** yes (sandbox clone in Chrome: 30 fps on `localhost`, taps land at 1.0–2.0 s; fallbacks on encoder death, freeze, no `VideoDecoder`, bad codec, plain-http `--remote lan`, no helper; share expiry ends video with no retry)
+- **Last completed:** 8.1 (screenshot gallery — screenshots go to `~/Desktop/sim-stream/`; owner-only `/gallery` with `sips` thumbnails)
+- **Build:** green (`node --check` ×5) · **Tests:** 77/77 `npm test` + 11 `swift test` (helper; untouched) · **Simulator-verified:** yes (sandbox clone: owner grid with thumbnails in Chrome, share link hidden + `403`, traversal `404`s via curl)
 
 ---
 
 ## Next Concrete Action
 
-> Implement 8.1 (screenshot gallery): screenshots move to
-> `~/Desktop/sim-stream/`; an owner-only `/gallery` page lists them newest
-> first with `sips` thumbnails cached in `.thumbs/`; files are served by bare
-> filename matched against the directory listing, never a path.
-> The listing and filename rules go in a new import-safe module with
-> `node:test` coverage, like `shares.js` and `h264.js`.
-> Scope and rules: `docs/ROADMAP.md` § Phase 8; defaults: `docs/DECISIONS.md` § Phase 7–8 defaults.
-> 8.1 is untagged: `/pilot` routes it to Opus; a Fable autopilot run halts on it.
+> Implement 8.2 (tap by accessibility label): a `tap-label` input event in
+> `dispatchInput` that queues `axe tap --label <text>` (or `--id <name>` for a
+> leading `#`) with `--tap-style physical`, plus a text field in the controls
+> panel; AXe's no-match / multiple-match error reaches the viewer as the normal
+> error toast.
+> Scope: `docs/ROADMAP.md` § Phase 8; defaults: `docs/DECISIONS.md` § Phase 7–8 defaults.
+> 8.2 is untagged: `/pilot` routes it to Opus; a Fable autopilot run halts on it.
 
 ---
 
 ## Open Decisions (reversible — defaults chosen, proceeding)
 
 - **Missing `cloudflared` binary in 6.1** → chose **fail immediately with the install command**, mirroring `start.sh`'s `axe` check → DECISIONS.md § Phase 6.2 deferred (phase 6)
-- **Who may open the screenshot gallery (8.1)** → chose **owner credential only; share links refused** → DECISIONS.md § Phase 7–8 defaults (phase 8)
-- **Gallery thumbnails (8.1)** → chose **`sips`, cached in `~/Desktop/sim-stream/.thumbs/`; old Desktop screenshots not migrated** → DECISIONS.md § Phase 7–8 defaults (phase 8)
+- **Who may open the screenshot gallery (8.1)** → chose **owner credential only; share links get `403`** → DECISIONS.md § Phase 7–8 defaults (phase 8)
+- **Gallery thumbnails (8.1)** → chose **`sips`, cached in `~/Desktop/sim-stream/.thumbs/`; full image if `sips` fails; old Desktop screenshots not migrated** → DECISIONS.md § Screenshot gallery mechanics (8.1)
 - **Tap-by-label matching (8.2)** → chose **label text, `#name` for an identifier; AXe's own error on no/multiple matches, never a guess** → DECISIONS.md § Phase 7–8 defaults (phase 8)
 - **Does a screenshot gallery stay local or sync across devices?** → chose **local filesystem only** → DECISIONS.md § Build vs. adopt (phase 8)
 - **Multi-simulator support** → chose **out of scope; one simulator per server** → DECISIONS.md § Build vs. adopt
@@ -103,7 +102,7 @@
 
 ## Assumptions & Risks
 
-- **Automated tests cover only the two pure modules** (`npm test`: `shares.js`, the token registry, and `h264.js`, the `/video` hub's logic). Every other path — including the process plumbing that spawns AXe and the encoder — needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is still the manual checklist in `docs/architecture.md` § Testing strategy.
+- **Automated tests cover only the import-safe modules** (`npm test`: `shares.js`, the token registry; `h264.js`, the `/video` hub's logic; `gallery.js`, the gallery's serving rules). Every other path — including the process plumbing that spawns AXe and the encoder — needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is still the manual checklist in `docs/architecture.md` § Testing strategy.
 - **`boundsForDeviceType()` is a hand-maintained table.** A simulator model missing from it mis-maps taps silently — check `/api/info` bounds first when taps land wrong.
 - **The operator's own token still never expires** within a run, and it is the one on the `local:` / `--remote` banner lines. Only `--share` links die on their own — hand those out, not the top link.
 - **Tailscale providers were not re-run after 5.2 (expiring share links) changed the provider contract** (`start` now returns a token-free URL). `lan` was verified from a real phone and the Tailscale edit is the same one-line shape, but check the printed links on the next `tailscale-serve`/`-funnel` use.

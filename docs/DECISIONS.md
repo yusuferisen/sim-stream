@@ -572,3 +572,27 @@ Choices made while building the page's H.264 player; all reversible.
   from the CLI as well; the touch down/up style lands. Swipes and long-presses
   already use touch events. *Cost:* an AXe too old to know `--tap-style`
   fails every tap with its own error rather than silently.
+
+---
+
+## 2026-09-30 — Screenshot gallery mechanics (8.1)
+
+Choices made while building `/gallery`; all reversible.
+
+- **File names are local date and time to the millisecond**
+  (`sim-stream-2026-09-30-140503-042.png`) instead of the old epoch
+  milliseconds: readable in Finder, and they sort by time as text.
+- **A failed thumbnail serves the full image**, not an error — `sips` is
+  built into macOS, so this only matters when it is broken, and a slower page
+  beats a grid of broken images.
+- **`/gallery` does the same cookie handoff as `/`** (one `cookieHandoff`
+  middleware): opened as `/gallery?token=…` in a fresh browser, the page's
+  image requests would otherwise carry no credential and all fail.
+- **Share viewers are refused with `403`, not `401`** — they are
+  authenticated, just not the owner — and the page hides its gallery link from
+  them (`/api/info` → `gallery: false`).
+- **A final Express error handler replaces the default error page.** Found in
+  review: `:name` is decoded before `authCheck`, so an unauthenticated
+  `/gallery/file/%E0%A4%A.png` got Express's development error page with a
+  stack trace and server paths. *Rejected:* `NODE_ENV=production` — it would
+  depend on how the server is started.

@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 import { getRemoteProvider } from "./remote.js";
 import { ShareRegistry, mintToken, parseShareSpec } from "./shares.js";
 import { H264Hub, parsePngSize, planCapture } from "./h264.js";
+import { ThumbCache, galleryDir, listScreenshots, renderGalleryPage, resolveScreenshot, screenshotName, sipsArgs } from "./gallery.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -74,6 +75,9 @@ const H264_FPS = args.fps !== undefined ? FPS : 30;
 const ENCODER = path.join(__dirname, "helper", ".build", "release", "sim-stream-encoder");
 const REQUIRE_AUTH = args.auth !== "false";
 const REMOTE = getRemoteProvider(args.remote || null);
+// Screenshots, and the /gallery that lists them (gallery.js).
+const GALLERY_DIR = galleryDir();
+const tildePath = (p) => (p.startsWith(os.homedir() + path.sep) ? `~${p.slice(os.homedir().length)}` : p);
 
 // Every token the server accepts lives in one in-memory registry (shares.js):
 // the operator's own, valid until the process exits, plus one expiring token
@@ -152,6 +156,13 @@ function trackSession(share, close) {
 
 function shareLive(share) {
   return !SHARES || SHARES.isLive(share);
+}
+
+// The owner credential — or anyone at all when auth is off, since then there
+// is no owner to tell apart. Share links are for driving the simulator, not
+// for browsing what was captured before they were issued.
+function isOwner(share) {
+  return !SHARES || share === SHARES.owner;
 }
 
 function authCookieHeader(req, share) {
@@ -664,10 +675,11 @@ async function dispatchInput(queue, bounds, evt) {
       const allowed = ["home", "lock", "side-button", "siri", "apple-pay", "screenshot"];
       const name = evt.name;
       if (name === "screenshot") {
-        const dest = `${process.env.HOME}/Desktop/sim-stream-${Date.now()}.png`;
+        await fs.promises.mkdir(GALLERY_DIR, { recursive: true });
+        const dest = path.join(GALLERY_DIR, screenshotName());
         await runScreenshot(queue.udid, dest);
         console.log(`[button] screenshot saved to ${dest}`);
-        return { detail: `saved to ${dest.replace(process.env.HOME, "~")}` };
+        return { detail: `saved to ${tildePath(dest)}` };
       }
       if (!allowed.includes(name)) throw new Error(`unknown button: ${name}`);
       await queue.push(["button", name]);
@@ -692,6 +704,26 @@ function runScreenshot(udid, dest) {
       clearTimeout(timer);
       if (code === 0) resolve();
       else reject(new Error(`simctl screenshot exit=${code}`));
+    });
+    proc.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
+// Writes a JPEG thumbnail of `src` to `dest` with macOS's built-in `sips`.
+function runSips(src, dest) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("sips", sipsArgs(src, dest), { stdio: "ignore" });
+    const timer = setTimeout(() => {
+      proc.kill("SIGKILL");
+      reject(new Error("sips timed out"));
+    }, 10_000);
+    proc.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`sips exit=${code}`));
     });
     proc.on("error", (e) => {
       clearTimeout(timer);
@@ -756,23 +788,73 @@ async function main() {
     return res.status(401).type("text/plain").send("Unauthorized");
   };
 
-  app.get("/", authCheck, (req, res) => {
-    // Cookie handoff: an authorized page load that still has `token` in its
-    // URL gets the cookie and a redirect to the same URL without it, so the
-    // credential leaves the address bar before the page ever renders.
+  // Cookie handoff: an authorized page load that still has `token` in its URL
+  // gets the cookie and a redirect to the same URL without it, so the
+  // credential leaves the address bar before the page ever renders — and the
+  // page's own requests (/api/info, /stream, /ws, gallery images) are
+  // authorized by the cookie. Used by both HTML pages, `/` and `/gallery`.
+  const cookieHandoff = (req, res, next) => {
     const original = new URL(req.originalUrl, "http://x");
-    if (SHARES && original.searchParams.has("token")) {
-      original.searchParams.delete("token");
-      // A request with `?token=` is authorized by that token and nothing else
-      // (see requestAuthorized), so req.share is the share the link belongs to.
-      res.setHeader("Set-Cookie", authCookieHeader(req, req.share));
-      res.setHeader("Cache-Control", "no-store");
-      res.setHeader("Referrer-Policy", "no-referrer");
-      return res.redirect(302, original.pathname + original.search);
-    }
+    if (!SHARES || !original.searchParams.has("token")) return next();
+    original.searchParams.delete("token");
+    // A request with `?token=` is authorized by that token and nothing else
+    // (see requestAuthorized), so req.share is the share the link belongs to.
+    res.setHeader("Set-Cookie", authCookieHeader(req, req.share));
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    return res.redirect(302, original.pathname + original.search);
+  };
+
+  app.get("/", authCheck, cookieHandoff, (req, res) => {
     res.type("html").send(renderedHtml);
   });
-  app.get("/api/info", authCheck, (req, res) => res.json({ simulator: sim, bounds, fps: FPS, quality: QUALITY, scale: SCALE, h264: h264Info }));
+  app.get("/api/info", authCheck, (req, res) => res.json({
+    simulator: sim, bounds, fps: FPS, quality: QUALITY, scale: SCALE, h264: h264Info,
+    // Whether this viewer may open /gallery — the page shows the link only then.
+    gallery: isOwner(req.share),
+  }));
+
+  // --- Screenshot gallery (owner only; read-only) ---
+  // Files are named by a bare filename and served only if it is in the
+  // gallery directory's listing (gallery.js) — never a path from the request.
+  const thumbs = new ThumbCache({ dir: GALLERY_DIR, generate: runSips });
+  const ownerOnly = (req, res, next) => {
+    if (isOwner(req.share)) return next();
+    return res.status(403).type("text/plain").send("The screenshot gallery is only open to the server's owner, not to share links.");
+  };
+  const privateFile = (res, file, type) => {
+    res.setHeader("Cache-Control", "private, no-cache");
+    res.type(type).sendFile(file, { dotfiles: "allow" }, (e) => {
+      if (e && !res.headersSent) res.status(404).type("text/plain").send("Not found");
+    });
+  };
+  app.get("/gallery", authCheck, ownerOnly, cookieHandoff, async (req, res) => {
+    try {
+      const entries = await listScreenshots(GALLERY_DIR);
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Referrer-Policy", "no-referrer");
+      res.type("html").send(renderGalleryPage(entries, { dirShown: tildePath(GALLERY_DIR) }));
+    } catch (e) {
+      console.error(`[gallery] ${e.message}`);
+      res.status(500).type("text/plain").send("Could not read the screenshot folder");
+    }
+  });
+  app.get("/gallery/file/:name", authCheck, ownerOnly, async (req, res) => {
+    const file = await resolveScreenshot(GALLERY_DIR, req.params.name).catch(() => null);
+    if (!file) return res.status(404).type("text/plain").send("Not found");
+    privateFile(res, file, "png");
+  });
+  app.get("/gallery/thumb/:name", authCheck, ownerOnly, async (req, res) => {
+    const file = await resolveScreenshot(GALLERY_DIR, req.params.name).catch(() => null);
+    if (!file) return res.status(404).type("text/plain").send("Not found");
+    try {
+      privateFile(res, await thumbs.get(req.params.name), "jpeg");
+    } catch (e) {
+      // No thumbnail (sips missing or failed): the full image still shows.
+      console.error(`[gallery] thumbnail for ${req.params.name}: ${e.message}`);
+      privateFile(res, file, "png");
+    }
+  });
 
   app.get("/stream", authCheck, (req, res) => {
     res.writeHead(200, {
@@ -787,6 +869,16 @@ async function main() {
     // when the share behind it expires. destroy() fires "close", which is also
     // how the hub drops the client and keeps its refcount right.
     res.on("close", trackSession(req.share, () => res.destroy()));
+  });
+
+  // Express's default error page prints a stack trace with server paths, and
+  // a route parameter is decoded *before* authCheck runs — so a malformed one
+  // (`/gallery/file/%E0%A4%A.png`) would hand that page to anyone. Plain text.
+  app.use((err, req, res, _next) => {
+    const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 500;
+    if (status === 500) console.error(`[http] ${req.method} ${req.path}: ${err.message}`);
+    if (res.headersSent) return res.destroy();
+    res.status(status).type("text/plain").send(status === 500 ? "Internal error" : "Bad request");
   });
 
   const server = http.createServer(app);

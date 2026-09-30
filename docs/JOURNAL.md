@@ -231,3 +231,18 @@ encoder → MJPEG with one `/video` connect in the log; freezing it → MJPEG in
 4.2 s; no `VideoDecoder`, a refused codec, plain-http `--remote lan`, and no
 helper → MJPEG from the start; a 20 s share expiring while the tab was hidden
 did not rejoin. Tests unchanged: `npm test` 59/59, `swift test` 11.
+
+## 2026-09-30 — 8.1 (screenshot gallery)
+
+Screenshots now land in `~/Desktop/sim-stream/` under readable local-time names,
+and the owner's controls panel links to a read-only `/gallery`: newest first,
+`sips` thumbnails cached in `.thumbs/`, each opening the full PNG. The rules
+live in the new import-safe `gallery.js` — a request names a bare file that must
+be a regular, listed `.png` (symlinks, dot-files, `..`, encoded `/` all 404).
+Share links get `403` and no link; `/gallery?token=` does the cookie handoff.
+
+Gotcha found in review: a route parameter is decoded before `authCheck`, so a
+malformed `%`-escape made Express answer anyone with its stack-trace error page;
+a final plain-text error handler closes it. Verified on the run's sandbox clone
+with curl and Chrome (owner grid with thumbnails, share page without the link and
+`403`, traversal `404`s). `npm test` 77/77 (18 new in `test/gallery.test.js`).

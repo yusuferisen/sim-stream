@@ -38,6 +38,7 @@ flowchart TB
             vhub["h264.js — H264Hub<br/>refcounted, 5s grace<br/>keyframe on join · slow-viewer skip"]
             queue["CommandQueue<br/>FIFO, one axe at a time"]
             info["/api/info<br/>simulator · bounds · stream cfg"]
+            gal["/gallery — gallery.js<br/>owner only · listing-matched names<br/>sips thumbnails"]
         end
         remote["remote.js<br/>PROVIDERS: lan · tailscale-serve · tailscale-funnel"]
         axe["axe CLI"]
@@ -57,6 +58,8 @@ flowchart TB
     script -- "WS /video" --> auth
     auth --> queue
     auth --> info
+    auth -- "owner credential only" --> gal
+    gal -- "read ~/Desktop/sim-stream/" --> desk["~/Desktop/sim-stream/<br/>screenshots + .thumbs/"]
     reg -. "on expiry: end that share's /stream, /ws + /video" .-> auth
     hub -- "spawn axe stream-video --format mjpeg" --> axe
     vhub -- "spawn axe stream-video --format bgra" --> axe
@@ -73,7 +76,8 @@ flowchart TB
 ## State model
 
 There is no database and nothing persists between runs. The only durable
-artifacts are screenshots written to `~/Desktop/`. What the system holds is
+artifacts are screenshots written to `~/Desktop/sim-stream/` (plus their
+cached thumbnails in `.thumbs/` there). What the system holds is
 process state — the capture process below, and the token registry after it.
 The H.264 hub runs the same state machine over its own pipeline (AXe plus the
 encoder helper), independently of the MJPEG one:
@@ -176,7 +180,13 @@ server runs exactly as before and says "MJPEG only" at startup.
 and can save the stream for `ffprobe`.
 
 **Capture what you're looking at.** The screenshot control saves to
-`~/Desktop/sim-stream-<timestamp>.png` and confirms with a toast.
+`~/Desktop/sim-stream/sim-stream-<date>-<time>.png` and confirms with a toast.
+
+**Find it again.** The owner's controls panel links to `/gallery`: every
+screenshot in that folder, newest first, as `sips` thumbnails that open the
+full image. It is read-only, and it answers only to the owner credential — a
+share link's viewer sees no link and gets `403` (with `--auth false`, like
+everything else, it is open).
 
 **Use it on a phone.** At ≤720 px wide the layout goes fullscreen and the
 controls collapse into a bottom sheet behind a corner ⋯ button. Backdrop tap or

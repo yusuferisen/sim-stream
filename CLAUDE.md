@@ -9,7 +9,8 @@ input, via the AXe CLI. Single surface at the repo root (no surface folders).
 server.js            HTTP + WebSocket + MJPEG hub + AXe command queue + auth
 shares.js            Token registry — owner token + expiring --share tokens (pure, unit-tested)
 h264.js              H.264 path logic — record parser, GOP cache, the /video hub (pure, unit-tested)
-test/                node:test suites for the two pure modules (shares.js, h264.js)
+gallery.js           Screenshot gallery rules — names, listing-matched serving, thumbnail cache, page (unit-tested)
+test/                node:test suites for the import-safe modules (shares.js, h264.js, gallery.js)
 remote.js            Remote-access providers (prepare/start/stop), --remote <name>
 public/index.html    The entire client — markup, styles, script in one file
 scripts/start.sh     Dev launcher: checks AXe, installs deps, builds the helper, boots the sim
@@ -21,8 +22,9 @@ docs/                PRD · ROADMAP · OVERVIEW · JOURNAL · DECISIONS · archi
 
 ## Build / run / test contract
 
-There is no required build step. `npm test` covers only the two pure modules —
-`shares.js` (the token registry) and `h264.js` (the H.264 hub's logic); the
+There is no required build step. `npm test` covers only the import-safe modules —
+`shares.js` (the token registry), `h264.js` (the H.264 hub's logic) and
+`gallery.js` (the screenshot gallery's serving rules); the
 optional encoder helper has its own `swift test`; everything else is verified
 by hand — see below.
 
@@ -34,10 +36,10 @@ npm install                                  # deps: express, ws
 ./scripts/start.sh --remote lan              # reachable on the LAN
 ./scripts/start.sh --share demo=2h           # also mint an expiring link
 node server.js --port 9090                   # server directly; same flags
-node --check server.js && node --check remote.js && node --check shares.js && node --check h264.js   # syntax gate
+for f in server.js remote.js shares.js h264.js gallery.js; do node --check $f; done   # syntax gate
 npm run build:helper                         # optional: build helper/ (needs swift)
 (cd helper && swift test)                    # helper's argument/layout/framing tests
-npm test                                     # node --test — shares.js + h264.js unit tests, no simulator
+npm test                                     # node --test — shares/h264/gallery unit tests, no simulator
 node scripts/video-probe.js --token <T>      # against a running server: 5 s of /video, fps + close code
 ```
 

@@ -185,8 +185,13 @@ map and it becomes selectable as `--remote <name>`. No other code changes.
 - **Hardware buttons** — Home, Lock, Siri
 - **Quick swipes** — the ▲/▼/←/→ buttons send preset swipes from the
   center of the screen
-- **Screenshot** — saved to `~/Desktop/sim-stream-<timestamp>.png`, with a
-  toast confirmation
+- **Screenshot** — saved to `~/Desktop/sim-stream/`, with a toast
+  confirmation. **Screenshot gallery ↗** (in the same panel) opens `/gallery`,
+  a newest-first thumbnail grid of that folder; click one for the full image.
+  Only your own token opens it — a `--share` link can take screenshots but
+  gets `403` on the gallery. Thumbnails are made with macOS's `sips` and
+  cached in `~/Desktop/sim-stream/.thumbs/`. Screenshots saved by older
+  versions (`~/Desktop/sim-stream-*.png`) stay where they are.
 
 On narrow viewports (≤720px wide), the controls panel collapses into a
 bottom sheet opened by a corner ⋯ button. Tap a backdrop or drag the
@@ -261,6 +266,8 @@ at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
 | `test/h264.test.js`       | Unit tests for it (`npm test`; no simulator needed)                  |
 | `scripts/video-probe.js`  | Scripted `/video` client: frame rate, close code, saves the stream   |
 | `shares.js`               | The token registry: your token plus expiring share tokens            |
+| `gallery.js`              | Screenshot gallery: file names, which files may be served, thumbnails, the page |
+| `test/gallery.test.js`    | Unit tests for it (`npm test`; no simulator needed)                  |
 | `test/shares.test.js`     | Unit tests for the registry (`npm test`; no simulator needed)        |
 | `remote.js`               | Pluggable remote-access providers (LAN / Tailscale Serve / Funnel)   |
 | `public/index.html`       | Single-page client: H.264 `<canvas>` player / MJPEG `<img>`, pointer/gesture detection, toolbar |
