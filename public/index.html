@@ -307,9 +307,9 @@
 
 <script>
 (() => {
-  const qs = new URLSearchParams(location.search);
-  const token = qs.get("token") || "";
-  const authParam = token ? `?token=${encodeURIComponent(token)}` : "";
+  // No credential handling here: the server traded `?token=` for an httpOnly
+  // cookie on page load, and the browser attaches it to /api/info, /stream,
+  // and the /ws upgrade on its own (all same-origin).
 
   const $ = (id) => document.getElementById(id);
   const screen = $("screen");
@@ -346,12 +346,12 @@
   // the page template — but we still defer setting src so the img doesn't
   // begin before we know the device info.
   // -----------------------------------------------------------------------
-  fetch(`/api/info${authParam}`).then((r) => r.json()).then((info) => {
+  fetch("/api/info").then((r) => r.json()).then((info) => {
     const sim = info.simulator || {};
     metaLabel.textContent = `${sim.name || "?"} • ${sim.runtime || ""}`;
     simInfo.textContent = `${sim.name}\n${sim.runtime}\nudid: ${sim.udid?.slice(0, 8)}…`;
     if (info.bounds && info.bounds.w) bounds = info.bounds;
-    screen.src = `/stream${authParam}`;
+    screen.src = "/stream";
   }).catch((e) => {
     console.error(e);
     toast("Could not load simulator info — check auth token", "bad");
@@ -367,7 +367,7 @@
   const WS_BACKOFF_MAX = 30_000;
   function connectWs() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(`${proto}//${location.host}/ws${authParam}`);
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
     ws.onopen = () => {
       wsReady = true;
       wsBackoffMs = 1500;
@@ -410,7 +410,7 @@
     } else if (status === "dead") {
       streamDot.classList.remove("ok"); streamDot.classList.add("bad");
       // Kick the img to force a reconnect: server will respawn AXe.
-      if (screen.src) screen.src = `/stream${authParam}&_r=${Date.now()}`;
+      if (screen.src) screen.src = `/stream?_r=${Date.now()}`;
     }
   }
 

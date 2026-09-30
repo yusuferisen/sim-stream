@@ -61,7 +61,9 @@ See [Remote access](#remote-access) for the full list of `--remote`
 providers (LAN, Tailscale Serve, Tailscale Funnel for public sharing).
 
 The script will boot the selected simulator if it isn't running, then start
-the web server. It prints a URL including a random auth token:
+the web server. It prints a URL including a random auth token. Opening it
+trades the token for an httpOnly cookie and redirects to the same URL without
+it, so the token leaves the address bar and browser history:
 
 ```
 sim-stream running
@@ -112,7 +114,9 @@ still pass `--host` directly if you need full control.
 
 Keep the token secret — it's the only thing gating access when exposed.
 For `tailscale-funnel` especially: the URL is publicly reachable; the
-token is your only auth.
+token is your only auth. The printed link still carries it, so share it
+deliberately; once opened, the browser holds it only in an httpOnly cookie
+(scoped to the port, cleared when the browser session ends).
 
 ### Adding new remote providers
 
@@ -156,7 +160,7 @@ All flags can be passed to `scripts/start.sh` or to `node server.js` directly:
 | `--quality <N>`  | `75`        | JPEG quality (1–100)                          |
 | `--scale <N>`    | `0.5`       | Frame size multiplier (0.1–1.0)               |
 | `--udid <UDID>`  | auto        | Specific simulator UDID                       |
-| `--token <str>`  | random hex  | Auth token. HTTP accepts `?token=…` or an `x-token` header; the WebSocket accepts `?token=…` only |
+| `--token <str>`  | random hex  | Auth token. Every route and the WebSocket accept `?token=…`, an `x-token` header (scripts), or the httpOnly cookie set when the page is opened |
 | `--auth false`   | on          | Disable auth (local only)                     |
 | `--no-auth`      | —           | Same as `--auth false` (start.sh shorthand)   |
 | `--remote <p>`   | —           | Remote-access provider: `lan`, `tailscale-serve`, `tailscale-funnel` |
@@ -223,7 +227,9 @@ device model.
 
 **Browser shows the screen but input does nothing** — the "input" dot in
 the header should be green. If it's red, the WebSocket couldn't
-authenticate — check the token in your URL.
+authenticate — reopen the printed `?token=…` link. The page itself relies
+on a cookie, so a browser that blocks cookies for the host gets `401` after
+the redirect.
 
 **Stream freezes after a while** — the underlying AXe process likely
 crashed. Reload the page; the server will respawn it on the next connect.

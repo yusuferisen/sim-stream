@@ -70,6 +70,45 @@ function tokenMatches(provided) {
   return timingSafeEqual(a, TOKEN_BUF);
 }
 
+// --- Credential channels ---------------------------------------------------
+//
+// A request may carry the token three ways: `?token=` (the shareable link —
+// leaks into URL bars and history, so `GET /` trades it for the cookie and
+// redirects), the `x-token` header (scripted access; never reaches a URL), and
+// the httpOnly cookie set by that handoff. Every entry point — the HTTP routes
+// AND the WebSocket upgrade — authorizes through `requestAuthorized()`, so the
+// channels cannot drift apart between check sites.
+//
+// Cookies are scoped by host, not port, so the name carries the port: two
+// servers on one machine would otherwise overwrite each other's cookie.
+const AUTH_COOKIE = `sim_stream_${PORT}`;
+
+function readCookie(req, name) {
+  const header = req.headers.cookie;
+  if (typeof header !== "string") return undefined;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1 || part.slice(0, eq).trim() !== name) continue;
+    try { return decodeURIComponent(part.slice(eq + 1).trim()); } catch { return undefined; }
+  }
+  return undefined;
+}
+
+function requestAuthorized(req, queryToken) {
+  if (!REQUIRE_AUTH) return true;
+  return [queryToken, req.headers["x-token"], readCookie(req, AUTH_COOKIE)].some(tokenMatches);
+}
+
+function authCookieHeader(req) {
+  // `Secure` only when the browser is actually on https (directly or through a
+  // TLS-terminating tunnel such as Tailscale Serve); on plain http a Secure
+  // cookie is silently dropped and the redirect would land unauthenticated.
+  // `SameSite=Lax`, not Strict: the link is usually opened from another app,
+  // and Strict would withhold the cookie on that cross-site redirect.
+  const https = req.secure || req.headers["x-forwarded-proto"] === "https";
+  return `${AUTH_COOKIE}=${encodeURIComponent(TOKEN)}; Path=/; HttpOnly; SameSite=Lax${https ? "; Secure" : ""}`;
+}
+
 // --- Simulator discovery ---------------------------------------------------
 
 function listSimulators() {
@@ -462,13 +501,25 @@ async function main() {
   const renderedHtml = htmlTemplate.replace("__ASPECT__", `${bounds.w} / ${bounds.h}`);
 
   const authCheck = (req, res, next) => {
-    if (!REQUIRE_AUTH) return next();
-    const provided = req.query.token || req.headers["x-token"];
-    if (tokenMatches(provided)) return next();
+    const q = typeof req.query.token === "string" ? req.query.token : undefined;
+    if (requestAuthorized(req, q)) return next();
     return res.status(401).type("text/plain").send("Unauthorized");
   };
 
-  app.get("/", authCheck, (req, res) => res.type("html").send(renderedHtml));
+  app.get("/", authCheck, (req, res) => {
+    // Cookie handoff: an authorized page load that still has `token` in its
+    // URL gets the cookie and a redirect to the same URL without it, so the
+    // credential leaves the address bar before the page ever renders.
+    const original = new URL(req.originalUrl, "http://x");
+    if (REQUIRE_AUTH && original.searchParams.has("token")) {
+      original.searchParams.delete("token");
+      res.setHeader("Set-Cookie", authCookieHeader(req));
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Referrer-Policy", "no-referrer");
+      return res.redirect(302, original.pathname + original.search);
+    }
+    res.type("html").send(renderedHtml);
+  });
   app.get("/api/info", authCheck, (req, res) => res.json({ simulator: sim, bounds, fps: FPS, quality: QUALITY, scale: SCALE }));
 
   app.get("/stream", authCheck, (req, res) => {
@@ -497,7 +548,7 @@ async function main() {
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (url.pathname !== "/ws") return socket.destroy();
-    if (REQUIRE_AUTH && !tokenMatches(url.searchParams.get("token"))) {
+    if (!requestAuthorized(req, url.searchParams.get("token") ?? undefined)) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       return socket.destroy();
     }

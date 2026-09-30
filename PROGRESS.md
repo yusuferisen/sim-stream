@@ -10,7 +10,7 @@
 - **Project:** sim-stream
 - **Target milestone:** Safe public sharing — stop here for review
 - **Status:** `in-progress`
-- **Updated:** 2026-07-31
+- **Updated:** 2026-09-30
 
 ---
 
@@ -43,7 +43,7 @@
 - [x] **Phase 4 — Build-vs-adopt evaluation**
   - [x] 4.1 SimCast evaluation — verdict: keep `sim-stream`
 - [ ] **Phase 5 — Token & session hardening**
-  - [ ] 5.1 Cookie handoff — authenticate once, set an httpOnly cookie, redirect to a clean URL; both check sites accept it, `x-token` retained
+  - [x] 5.1 Cookie handoff → both check sites share one `requestAuthorized()`; the WS upgrade now also accepts `x-token`
   - [ ] 5.2 Expiring per-share tokens — in-memory registry (value, expiry, label) minted at startup, replacing the single constant [model: fable]
 - [ ] **Phase 6 — Cloudflare quick tunnel**
   - [ ] 6.1 `cloudflared` provider — anonymous quick tunnel, mandatory `stop`; verify the edge does not buffer MJPEG
@@ -62,24 +62,26 @@
 
 ## Current Status
 
-- **Current phase / sub-phase:** 5.1 — cookie handoff
+- **Current phase / sub-phase:** 5.2 — expiring per-share tokens
 - **State:** not-started
-- **Last completed:** 4.1 (SimCast evaluated; keeping `sim-stream` — the auth model and bring-up cost decided it)
-- **Build:** green · **Tests:** n/a (no suite — see Assumptions & Risks) · **Simulator-verified:** n/a
+- **Last completed:** 5.1 (cookie handoff — token leaves the address bar on first load)
+- **Build:** green (`node --check`) · **Tests:** n/a (no suite) · **Simulator-verified:** yes (sandbox clone: redirect, httpOnly cookie, stream, WS input, reload grace window)
 
 ---
 
 ## Next Concrete Action
 
-> Implement 5.1: in `server.js`, have `authCheck` set an httpOnly cookie after a
-> successful match on `GET /`, then redirect to the token-free URL. Both check
-> sites need the cookie added, and they differ today: `authCheck` (used by `/`,
-> `/api/info`, `/stream`) accepts `?token=` **or** the `x-token` header, while
-> the `server.on("upgrade")` handler accepts `?token=` only. `x-token` is
-> retained by decision — document it as the scripted path, don't remove it.
-> Keep close code `1008` as the auth-failure signal; the client's error toast
-> depends on it. Verify by loading the URL on a phone: the address bar no
-> longer shows the token, and the stream plus WebSocket input still work.
+> Implement 5.2 (expiring per-share tokens) on **Fable** — it is tagged
+> `[model: fable]`, so a run on any other model halts here by design.
+> In `server.js`, replace `TOKEN`/`TOKEN_BUF` with an in-memory registry of
+> `{value, expiry, label}` minted at startup from repeatable flags;
+> `tokenMatches()` walks it (constant-time per entry) and rejects expired entries.
+> `requestAuthorized()` is the single check point for query, `x-token`, and the
+> cookie, so expiry applies to all three channels once `tokenMatches` knows it.
+> Set the handoff cookie's `Max-Age` to the matched share's remaining lifetime,
+> and make the cookie store the *matched* token (today `authCookieHeader` writes
+> the constant `TOKEN`). Print one URL per share at startup; update `remote.js`
+> `start({token})` callers to match.
 
 ---
 
@@ -108,7 +110,8 @@ rather than here — it blocks a post-milestone phase, not the run.
 - **No automated test suite.** Every path needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is the manual browser checklist in `docs/architecture.md` § Testing strategy.
 - **Host prerequisites:** macOS with Xcode simulators, `axe` (`brew install cameroncooke/axe/axe`), Node 18+.
 - **`boundsForDeviceType()` is a hand-maintained table.** A simulator model missing from it mis-maps taps silently — check `/api/info` bounds first when taps land wrong.
-- **The token never expires and rides in the URL.** On a `tailscale-funnel` URL it is the only gate. Phase 5 exists for this.
+- **The token never expires.** It leaves the address bar on first load (5.1), but the shared link still carries it and it stays valid for the process lifetime — 5.2 (expiring share tokens) closes this.
+- **`axe tap` is slow on the iOS 27 sandbox clone while streaming** (~10 s direct, vs. the queue's 5 s timeout), so taps time out there; buttons ack fine. Observed during 5.1 verification, predates it — recheck on the home phone before blaming the queue.
 - **Cloudflare's edge may buffer `multipart/x-mixed-replace`.** Test an actual tunnel before recommending either Phase 6 provider over Tailscale.
 - **`docs/OVERVIEW.md` and `docs/architecture.md` were inferred by `/adopt` on 2026-07-31** from the code — their claims were source-verified in review, but they describe intent they weren't written from.
 - **Phase 6b needs a domain on a Cloudflare account** (plus a named tunnel and an Access policy) before it can be built or verified. It sits past the milestone for exactly this reason; a run reaching it should halt.

@@ -9,7 +9,8 @@
 `sim-stream` puts a live, interactive iOS Simulator in a web browser. A Node
 server on the Mac that hosts the simulator spawns the [AXe
 CLI](https://github.com/cameroncooke/AXe) to capture frames and to inject
-input, and serves both over plain HTTP/WebSocket behind a token in the URL.
+input, and serves both over plain HTTP/WebSocket behind a shareable token link (exchanged
+for an httpOnly cookie on first load).
 There is no account, no hosted backend, and no build step — `npm i && node
 server.js`. Reaching it from outside the machine is opt-in: `--remote` selects
 a provider (Tailscale today), and that is the only point at which anything
@@ -27,7 +28,7 @@ flowchart TB
 
     subgraph mac["Mac host"]
         subgraph srv["server.js (Express + ws)"]
-            auth["authCheck<br/>timingSafeEqual on token"]
+            auth["requestAuthorized<br/>query · x-token · cookie<br/>timingSafeEqual"]
             hub["MjpegHub<br/>refcounted, 5s grace"]
             queue["CommandQueue<br/>FIFO, one axe at a time"]
             info["/api/info<br/>simulator · bounds · stream cfg"]
@@ -85,7 +86,9 @@ and `TOKEN`.
 (or `--remote tailscale-serve` for the tailnet, `--remote tailscale-funnel` for
 a publicly reachable URL). The launcher checks that AXe is installed, installs
 node deps if missing, boots the chosen simulator if it isn't running, and
-prints a URL with the token embedded. Opening it shows the live screen.
+prints a URL with the token embedded. Opening it sets an httpOnly cookie and
+redirects to the token-free URL, then shows the live screen; the stream and
+the input WebSocket authenticate from that cookie.
 
 **Pick which simulator.** `--list` prints every available device with its boot
 state. Without `--udid`, the server auto-picks — preferring one that's already
@@ -128,5 +131,6 @@ Known and accepted, not defects:
 - **One simulator per server.** The UDID is fixed at startup.
 - **No stream heartbeat beyond start/stop.** If the AXe process *hangs* rather
   than exits, the status dot can stay green until something eventually throws.
-- **A permanent token in the URL** is the only access control. See
-  `docs/ROADMAP.md` § Phase 5.
+- **A permanent token** is the only access control. It leaves the address bar
+  on first load, but the shared link still carries it and it never expires.
+  See `docs/ROADMAP.md` § Phase 5 (expiring share tokens).

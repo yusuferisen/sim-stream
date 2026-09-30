@@ -110,3 +110,18 @@ pipeline and had no `PROGRESS.md`, so `autopilot-doctor.sh` exited 3.
 Milestone placed after Phase 6 (**Safe public sharing**) per an explicit
 decision during adoption: the token in the URL bar is the only gate on a
 Tailscale Funnel URL, so hardening ranks above the framerate rewrite.
+
+---
+
+## 2026-09-30 — 5.1 (cookie handoff)
+
+An authorized `GET /?token=…` now sets an httpOnly `sim_stream_<PORT>` cookie
+(`SameSite=Lax`, `Secure` over https) and 302s to the token-free URL. Both check
+sites (HTTP `authCheck`, WS upgrade) call one `requestAuthorized()` accepting
+query, `x-token`, or cookie, which ends the old query-only WS asymmetry. The
+client no longer reads or forwards the token; that also fixed a latent
+malformed `/stream&_r=` reconnect URL under `--auth false`. Verified by hand on
+a sandbox clone: a 13-case curl/ws auth matrix, plus a real browser where the
+address bar was clean, `document.cookie` was empty, and the stream, WS, and
+reload grace window all held. Gotcha: `axe tap` takes ~10 s on the iOS 27 clone
+while streaming, which is environmental and unrelated to auth.

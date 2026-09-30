@@ -260,3 +260,35 @@ a session on another model halts at 5.2 by design.
 self-announcing) and tagging neither (defensible — this is ~100 lines of Node in
 a personal tool with no accounts or user data — but expiry is precisely the
 piece worth paying for).
+
+---
+
+## 2026-09-30 — Cookie handoff mechanics (5.1)
+
+**Chose:** an authorized `GET /?token=…` sets `sim_stream_<PORT>` (the token
+value itself; `HttpOnly; SameSite=Lax; Path=/`, `Secure` only over https) and
+302s to the token-free URL. One `requestAuthorized()` serves both check sites
+and accepts query, `x-token`, or cookie at each — so the WebSocket upgrade now
+also takes `x-token`, and the asymmetry the `x-token` decision warned about is
+gone.
+
+**Why:**
+- **`Lax`, not `Strict`.** The link is typically opened from another app
+  (Messages, Slack); `Strict` withholds the cookie on that cross-site redirect
+  and the first load would land on `401`.
+- **Port in the name.** Cookies are host-scoped; two servers on one Mac would
+  otherwise clobber each other's cookie and log each other out.
+- **The token as the cookie value, not a session id.** No server-side session
+  table to keep in sync; whatever validity rule governs the token (5.2's
+  expiry) governs the cookie automatically.
+- **Session cookie, no `Max-Age`.** The token never expires yet, so any
+  lifetime would be arbitrary; 5.2 can align it with share expiry.
+- **Conditional `Secure`.** A `Secure` cookie on plain http (LAN, localhost) is
+  dropped, which would turn the redirect into a `401`.
+
+**Rejected:** keeping `?token=` in the client's own requests (leaves it in the
+page URL, the whole point is lost) and redirecting on every route (only the
+page load is a navigation that lands in the address bar and history).
+
+**Cost accepted:** a browser that blocks cookies for the host now gets `401`
+after the redirect instead of working from the URL.

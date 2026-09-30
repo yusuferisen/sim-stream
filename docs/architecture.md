@@ -76,15 +76,22 @@ if nothing throws.
   only the server knows logical points. `dispatchInput`'s `pt()` clamps to
   `[0,1]` before scaling by `bounds`, so a malformed or out-of-range event
   cannot produce an off-screen coordinate.
-- **Auth is checked at two sites, and they are not symmetric.** Every HTTP
-  route (`/`, `/api/info`, `/stream`) goes through the `authCheck` middleware,
-  which accepts **either** `?token=` **or** an `x-token` request header. The
+- **Auth is checked at two sites through one function.** Every HTTP route
+  (`/`, `/api/info`, `/stream`) goes through the `authCheck` middleware; the
   WebSocket is checked separately in `server.on("upgrade")` before
-  `handleUpgrade`, and accepts **only** `?token=`. The browser client uses the
-  query param for both and never sends `x-token` — that header exists for
-  scripted access. Any change to how credentials are carried has to touch both
-  sites *and* account for the header. A new entry point without a check is a
-  hole.
+  `handleUpgrade`. Both call `requestAuthorized(req, queryToken)`, which
+  accepts any of three channels: `?token=`, an `x-token` request header
+  (scripted access), or the `sim_stream_<PORT>` cookie. Credential channels
+  are added or removed **there**, never at a call site, so the two sites
+  cannot drift apart. A new entry point without a check is a hole.
+- **The token leaves the URL on page load.** An authorized `GET /` whose URL
+  still carries `token` responds `302` to the same URL minus that parameter,
+  with `Set-Cookie: sim_stream_<PORT>=…; HttpOnly; SameSite=Lax; Path=/`
+  (`Secure` when the request arrived over https, directly or via
+  `X-Forwarded-Proto`). The browser client never reads or forwards the token —
+  `/api/info`, `/stream`, and `/ws` are same-origin and ride the cookie. The
+  cookie name carries the port because cookies are host-scoped, not
+  port-scoped.
 - **Token comparison is constant-time.** `tokenMatches()` uses
   `crypto.timingSafeEqual` on equal-length buffers. Never replace it with `===`.
 - **Value flags fail loudly.** Flags in `VALUE_FLAGS` raise if their value is
@@ -149,7 +156,9 @@ Deliberate, and worth knowing before "fixing" them:
   backoff from 1500 ms; close codes `1006` and `1008` are read as auth failure
   and surface a single toast rather than a retry storm. The MJPEG `<img>` is
   kicked to force a reconnect, which is what makes the server respawn AXe.
-  Anything that changes how credentials are carried must keep `1008` meaning
+  The upgrade handler rejects with a raw `401` and destroys the socket, which
+  the browser surfaces as `1006`. Anything that changes how credentials are
+  carried must keep `1006`/`1008` meaning
   "your credential is bad" — it is the client's only auth feedback channel.
 
 ## Testing strategy
@@ -162,6 +171,8 @@ is a browser session:
 1. `./scripts/start.sh` — confirm it selects/boots a simulator and prints a URL.
 2. Open the URL — confirm the stream goes live and the header status dot is
    green.
+   The address bar must show the URL **without** `token` (cookie handoff), and
+   `curl -i` on the printed link must answer `302` with an `HttpOnly` cookie.
 3. Exercise each input path — tap, drag-swipe, long-press, typed text, a
    special key, a hardware button, a screenshot.
 4. Reload the page — confirm the AXe process is *not* restarted (grace window)
