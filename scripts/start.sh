@@ -9,6 +9,7 @@
 #   ./scripts/start.sh --remote lan              # bind to 0.0.0.0 (LAN access)
 #   ./scripts/start.sh --remote tailscale-serve  # private HTTPS over tailnet
 #   ./scripts/start.sh --remote tailscale-funnel # PUBLIC HTTPS via Funnel
+#   ./scripts/start.sh --share demo=2h           # also mint a link that expires (repeatable)
 #   ./scripts/start.sh --no-auth                 # disable token auth (local only!)
 # Any extra flags are passed through to node server.js. See README.md for the
 # full --remote provider list and prerequisites.

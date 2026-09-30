@@ -10,7 +10,8 @@
 server on the Mac that hosts the simulator spawns the [AXe
 CLI](https://github.com/cameroncooke/AXe) to capture frames and to inject
 input, and serves both over plain HTTP/WebSocket behind a shareable token link (exchanged
-for an httpOnly cookie on first load).
+for an httpOnly cookie on first load). Links minted for other people expire on
+their own.
 There is no account, no hosted backend, and no build step — `npm i && node
 server.js`. Reaching it from outside the machine is opt-in: `--remote` selects
 a provider (Tailscale today), and that is the only point at which anything
@@ -28,7 +29,8 @@ flowchart TB
 
     subgraph mac["Mac host"]
         subgraph srv["server.js (Express + ws)"]
-            auth["requestAuthorized<br/>query · x-token · cookie<br/>timingSafeEqual"]
+            auth["requestAuthorized<br/>query · x-token · cookie"]
+            reg["shares.js — ShareRegistry<br/>owner token + expiring shares<br/>timingSafeEqual · expiry sweep"]
             hub["MjpegHub<br/>refcounted, 5s grace"]
             queue["CommandQueue<br/>FIFO, one axe at a time"]
             info["/api/info<br/>simulator · bounds · stream cfg"]
@@ -41,9 +43,11 @@ flowchart TB
     img -- "GET /stream<br/>multipart/x-mixed-replace" --> auth
     ptr -- "WS /ws — JSON events" --> auth
     ctl -- "WS /ws" --> auth
+    auth -- "match token" --> reg
     auth --> hub
     auth --> queue
     auth --> info
+    reg -. "on expiry: end that share's /stream + /ws" .-> auth
     hub -- "spawn axe stream-video --format mjpeg" --> axe
     queue -- "spawn axe tap/swipe/touch/type/key/button" --> axe
     axe --> sim
@@ -56,7 +60,7 @@ flowchart TB
 
 There is no database and nothing persists between runs. The only durable
 artifacts are screenshots written to `~/Desktop/`. What the system holds is
-process state:
+process state — the capture process below, and the token registry after it:
 
 ```mermaid
 stateDiagram-v2
@@ -76,9 +80,25 @@ stateDiagram-v2
     end note
 ```
 
+Each token in the registry has its own small lifecycle. The owner token stays
+`live` for the whole run; a share does not:
+
+```mermaid
+stateDiagram-v2
+    [*] --> live: minted at startup (--share label=ttl)
+    live --> expired: deadline reached on either clock
+    expired --> [*]: never revived — restart mints new tokens
+    note right of expired
+        On the transition the server closes every
+        /stream and /ws the share authorized, and
+        its link, cookie and x-token all answer 401.
+    end note
+```
+
 Per-run configuration, resolved once at startup and never mutated: `PORT`,
 `HOST`, `FPS`, `QUALITY`, `SCALE`, the simulator UDID, its logical `bounds`,
-and `TOKEN`.
+and the set of tokens (the registry gains no entries after startup; shares
+only expire out of it).
 
 ## User stories, as currently implemented
 
@@ -89,6 +109,14 @@ node deps if missing, boots the chosen simulator if it isn't running, and
 prints a URL with the token embedded. Opening it sets an httpOnly cookie and
 redirects to the token-free URL, then shows the live screen; the stream and
 the input WebSocket authenticate from that cookie.
+
+**Hand someone a link that stops working.** Add `--share demo=2h` (repeatable;
+units `s`/`m`/`h`/`d`). Startup prints one extra link per share with its exact
+deadline, on the remote URL when there is one. At the deadline the link, the
+cookie it left behind, and any tab still open on it all stop together — the
+stream is cut and the page says the link has expired. The operator's own token
+is unaffected and lasts until the server stops; restarting the server revokes
+every link at once.
 
 **Pick which simulator.** `--list` prints every available device with its boot
 state. Without `--udid`, the server auto-picks — preferring one that's already
@@ -131,6 +159,9 @@ Known and accepted, not defects:
 - **One simulator per server.** The UDID is fixed at startup.
 - **No stream heartbeat beyond start/stop.** If the AXe process *hangs* rather
   than exits, the status dot can stay green until something eventually throws.
-- **A permanent token** is the only access control. It leaves the address bar
-  on first load, but the shared link still carries it and it never expires.
-  See `docs/ROADMAP.md` § Phase 5 (expiring share tokens).
+- **Shares can't be extended, revoked one at a time, or minted while
+  running.** They are fixed at startup; the only revocation is restarting the
+  server, which kills every link including the operator's own.
+- **The operator's own token never expires** within a run, and it is the one
+  printed on the `local:` / `--remote` lines. Handing *that* link out instead
+  of a `--share` link gives away access that only a restart ends.

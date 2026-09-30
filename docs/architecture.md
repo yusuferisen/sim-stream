@@ -15,7 +15,8 @@ process.
 
 | Module | Responsibility |
 |---|---|
-| `server.js` | Everything server-side: arg parsing, simulator discovery/boot, auth, HTTP routes, WebSocket, the MJPEG hub, the AXe command queue, input translation, shutdown. |
+| `server.js` | Everything server-side: arg parsing, simulator discovery/boot, the auth check sites, HTTP routes, WebSocket, the MJPEG hub, the AXe command queue, input translation, shutdown. |
+| `shares.js` | The credential registry (`ShareRegistry`): the owner token plus expiring share tokens, constant-time matching, the definition of expiry, and the tracking that ends long-lived connections when a share dies. Pure — no I/O, no side effects at import, clocks injectable — so it is unit-testable without a simulator. Also exports `parseTtl` / `parseShareSpec`. |
 | `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`. Knows nothing about streaming or input. |
 | `public/index.html` | The entire client — markup, styles, and script in one file. Served with one templated substitution. |
 | `scripts/start.sh` | Dev launcher: verifies AXe is present, installs node deps if absent, handles `--list`, translates `--no-auth` → `--auth false`, `exec`s the server. |
@@ -23,7 +24,8 @@ process.
 ## Dependencies
 
 - **Runtime:** Node 18+ (ESM, `crypto.timingSafeEqual`, `EventEmitter`).
-  Production deps are `express` and `ws` — nothing else.
+  Production deps are `express` and `ws` — nothing else. Tests use the
+  built-in `node:test` runner; there are no dev dependencies.
 - **External binaries:** `axe` (capture + HID injection) and `xcrun simctl`
   (device enumeration, boot, screenshots). Both must exist on the host; neither
   is installable in CI, which is why there is no CI.
@@ -80,23 +82,59 @@ if nothing throws.
   (`/`, `/api/info`, `/stream`) goes through the `authCheck` middleware; the
   WebSocket is checked separately in `server.on("upgrade")` before
   `handleUpgrade`. Both call `requestAuthorized(req, queryToken)`, which
-  accepts any of three channels: `?token=`, an `x-token` request header
-  (scripted access), or the `sim_stream_<PORT>` cookie. Credential channels
-  are added or removed **there**, never at a call site, so the two sites
-  cannot drift apart. A new entry point without a check is a hole.
+  returns the registry entry the request is authorized as (or `null`) from one
+  of three channels: `?token=`, an `x-token` request header (scripted access),
+  or the `sim_stream_<PORT>` cookie. Credential channels are added or removed
+  **there**, never at a call site, so the two sites cannot drift apart. A new
+  entry point without a check is a hole.
+- **One credential decides each request.** `?token=` if the request carries
+  one (even empty or malformed), otherwise `x-token`, otherwise the cookie —
+  with no falling through to a lower channel. A link therefore behaves the
+  same in every browser: a dead `?token=` is `401` even when the browser holds
+  a valid cookie, so an expired share link looks expired to the operator too.
+- **Every accepted token lives in one registry.** `ShareRegistry` holds the
+  owner token (entry 0, never expires) and one entry per `--share`, each
+  `{label, value, expiresAt}`. It is in-memory, populated once at startup, and
+  has no mint-over-HTTP path; restarting the process revokes everything. With
+  `--auth false` there is no registry, and `--share` is refused rather than
+  ignored.
+- **Expiry has a single definition: `ShareRegistry.remaining(entry)`.**
+  `match()`, the cookie's `Max-Age`, per-message WebSocket checks, and the
+  expiry sweep all go through it, so they cannot disagree about the boundary
+  (live at `expiresAt − 1 ms`, dead at `expiresAt`). A share is dead as soon
+  as **either** clock says so — the wall clock (the deadline printed at
+  startup; keeps counting through machine sleep) or the monotonic clock
+  (cannot be set back) — and expiry **latches**: once observed dead, an entry
+  stays dead whatever the clocks do. Every failure direction is "dies early,"
+  never "lives longer."
+- **Expiry ends open connections, not just new requests.** `/stream` and `/ws`
+  authorize once, at connect, so each registers with `ShareRegistry.track()`
+  against the share that admitted it. `watch()` sweeps at each deadline (and
+  at least once a second, which also keeps every delay under `setTimeout`'s
+  2³¹−1 ms ceiling): MJPEG responses are destroyed — which fires `close`, the
+  same path the hub's refcount uses — and WebSockets are closed with `1008`
+  and the reason `share expired`. Input is additionally checked per message,
+  because `close()` only starts a handshake and a client may never answer it.
+  A new long-lived entry point must `track()` its connection or it outlives
+  its link.
 - **The token leaves the URL on page load.** An authorized `GET /` whose URL
   still carries `token` responds `302` to the same URL minus that parameter,
   with `Set-Cookie: sim_stream_<PORT>=…; HttpOnly; SameSite=Lax; Path=/`
   (`Secure` when the request arrived over https, directly or via
-  `X-Forwarded-Proto`). The browser client never reads or forwards the token —
-  `/api/info`, `/stream`, and `/ws` are same-origin and ride the cookie. The
-  cookie name carries the port because cookies are host-scoped, not
-  port-scoped.
-- **Token comparison is constant-time.** `tokenMatches()` uses
-  `crypto.timingSafeEqual` on equal-length buffers. Never replace it with `===`.
+  `X-Forwarded-Proto`). The cookie holds the token that was presented, and for
+  a share carries `Max-Age` equal to its remaining lifetime (rounded up — the
+  server stays the authority); the owner's is a session cookie. The browser
+  client never reads or forwards the token — `/api/info`, `/stream`, and `/ws`
+  are same-origin and ride the cookie. The cookie name carries the port
+  because cookies are host-scoped, not port-scoped.
+- **Token comparison is constant-time.** `ShareRegistry.match()` uses
+  `crypto.timingSafeEqual` on equal-length buffers and compares against every
+  entry with no early exit. Never replace it with `===`.
 - **Value flags fail loudly.** Flags in `VALUE_FLAGS` raise if their value is
   missing, so `--token --port 9090` errors instead of silently treating
-  `token` as the boolean `true`.
+  `token` as the boolean `true`. Flags in `REPEATABLE_FLAGS` (`--share`)
+  accumulate into an array instead of last-one-wins. A `--share` TTL needs an
+  explicit unit and a unique label, or the server refuses to start.
 
 ## Seams
 
@@ -109,10 +147,13 @@ Places designed to be extended, and the contract each one implies.
   - `prepare() → {host}` — advises a bind address before `listen`. `lan`
     advises `0.0.0.0`; the Tailscale providers advise `127.0.0.1` and tunnel to
     it. An explicit `--host` always wins over the advice.
-  - `start({port, token}) → {url, note}` — establishes the tunnel and returns
-    what to print. Throwing here exits the process with the provider's message,
-    so failures should carry an actionable one (the Tailscale providers parse
-    the admin-console URL out of the CLI error and put it here).
+  - `start({port}) → {url, note}` — establishes the tunnel and returns what to
+    print. `url` is the **token-free base URL** (ending in `/`): providers know
+    nothing about auth, and the server appends `?token=…` itself — once for the
+    owner link and once per share. Throwing here exits the process with the
+    provider's message, so failures should carry an actionable one (the
+    Tailscale providers parse the admin-console URL out of the CLI error and
+    put it here).
   - `stop()` — teardown on shutdown. **A provider that spawns a long-lived
     process must implement it** or leak that process past exit.
 
@@ -160,13 +201,27 @@ Deliberate, and worth knowing before "fixing" them:
   the browser surfaces as `1006`. Anything that changes how credentials are
   carried must keep `1006`/`1008` meaning
   "your credential is bad" — it is the client's only auth feedback channel.
+  The one case the client does **not** retry is `1008` with the reason
+  `share expired`: the cookie is dead too, so it shows "This share link has
+  expired" once and stops.
+- **The share clock starts at process start, not at the banner.** Tokens are
+  minted while arguments are validated — before simulator boot and tunnel
+  setup — so a slow boot eats into a share's lifetime. That is the safe
+  direction, and the banner prints the absolute deadline, which is exact.
 
 ## Testing strategy
 
-There is **no automated test suite**, and the reason is structural: every
-meaningful path requires a booted iOS Simulator plus the AXe binary on macOS,
-so nothing here runs in CI. Verification is therefore manual and the phase gate
-is a browser session:
+**`npm test`** (`node --test`, no dependencies) covers the one module that
+needs no simulator: `shares.js` — TTL and `--share` parsing, token matching,
+the expiry boundary, the two-clock and latch rules, session tracking, and the
+expiry timer. Anything that changes how a token is accepted or when it dies
+belongs there first; expiry bugs are silent, and these tests are the only
+thing that would surface one.
+
+Everything else has **no automated coverage**, and the reason is structural:
+every other meaningful path requires a booted iOS Simulator plus the AXe binary
+on macOS, so nothing here runs in CI. Verification is therefore manual and the
+phase gate is a browser session:
 
 1. `./scripts/start.sh` — confirm it selects/boots a simulator and prints a URL.
 2. Open the URL — confirm the stream goes live and the header status dot is
@@ -180,8 +235,13 @@ is a browser session:
 5. Narrow the viewport below 720 px — confirm the bottom sheet behaves.
 6. If touching `remote.js`, verify at least the `lan` provider end-to-end from
    a second device.
+7. If touching auth, start with a short share (`--share 30s`), open its link,
+   and wait: at the deadline the page must show "This share link has expired",
+   the server must log the share's expiry with the number of connections it
+   closed, and reopening the link must answer `401` — including in a browser
+   that still holds your own cookie.
 
-Anything that *can* be unit-tested without a simulator — `parseArgs`,
-`tokenMatches`, `pt()` clamping, `boundsForDeviceType`, provider selection — is
-worth covering the moment a test runner is introduced, and a phase that changes
-those is a reasonable place to introduce one.
+The rest of what *can* be unit-tested without a simulator — `parseArgs`, `pt()`
+clamping, `boundsForDeviceType`, provider selection — still lives in
+`server.js`/`remote.js`, which run side effects at import. Covering them means
+moving them behind an import-safe module first, as `shares.js` was.

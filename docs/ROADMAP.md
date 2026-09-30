@@ -4,48 +4,11 @@
 > why it's worth doing, and what's out of scope. Carries **no execution state**:
 > the live checklist and all completion truth live in `PROGRESS.md`.
 >
-> Shipped phases (1–4: core streaming, mobile UI, remote providers, the
-> build-vs-adopt evaluation) have been pruned from here. Their narrative is in
+> Shipped phases (1–5: core streaming, mobile UI, remote providers, the
+> build-vs-adopt evaluation, token & session hardening) have been pruned from
+> here. Their narrative is in
 > `docs/JOURNAL.md`, their rationale in `docs/DECISIONS.md`, and the system as
 > built is described in `docs/OVERVIEW.md`.
-
----
-
-## Phase 5 — Token & session hardening
-
-**The problem.** The auth model is a capability URL: one random token, valid
-forever, carried in the query string. That was a deliberate trade for
-paste-into-a-phone ergonomics (`DECISIONS.md § Random token in the URL`), and
-it's fine on a LAN. It stops being fine the moment `--remote tailscale-funnel`
-puts the same URL on the public internet, where the token is visible in the URL
-bar, in browser history, in history sync, and in any screen-share of the page.
-
-**Scope.**
-
-- **Cookie handoff on first load.** Authenticate once from `?token=…`, set an
-  `httpOnly` cookie, then redirect to a clean URL. Subsequent requests —
-  including the `/stream` MJPEG connection and the `/ws` upgrade — authenticate
-  from the cookie. The token stops being shoulder-surfable and stops landing in
-  history. The `x-token` header **stays**: a header never reaches the URL bar,
-  history, or a screen-share, so it is the safest of the three channels, and
-  it's the scripted/`curl` path.
-- **Per-share, time-limited tokens.** Mint a token that expires after N hours,
-  so a Funnel URL handed to someone for a demo stops working on its own.
-  Implies more than one live token at a time, which the current single-`TOKEN`
-  comparison doesn't model — the server needs a small registry (value, expiry,
-  label) rather than one constant. **In-memory, minted at startup** via
-  repeatable flags; the registry dies with the process, which makes restarting
-  a guaranteed revoke-everything. No mint-over-HTTP: a token that can mint
-  successors defeats expiry as a boundary.
-
-**Out of scope.** Accounts, an identity provider, or any login UI. The whole
-point of the design is that a URL is the credential; these items make the
-credential leak less and expire, not turn it into a session system.
-
-**Watch for.** The WebSocket upgrade and the MJPEG stream authenticate on
-separate paths from the page load, so all three have to agree on the cookie —
-a partial conversion that leaves `/ws` on query-string auth would silently keep
-the token in the URL.
 
 ---
 
@@ -59,7 +22,7 @@ larger edge in front of the stream.
 
 **Scope.** One `PROVIDERS` entry implementing `prepare` (bind `127.0.0.1`),
 `start` (spawn the tunnel, parse the assigned hostname out of its output,
-return the URL), and `stop` — **`stop` is mandatory here**: the tunnel is a
+return the token-free base URL — the server adds the tokens), and `stop` — **`stop` is mandatory here**: the tunnel is a
 long-lived child process and without teardown it outlives the server.
 
 **Trade-off to settle before recommending it.** MJPEG is a single long-lived

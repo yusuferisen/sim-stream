@@ -125,3 +125,31 @@ a sandbox clone: a 13-case curl/ws auth matrix, plus a real browser where the
 address bar was clean, `document.cookie` was empty, and the stream, WS, and
 reload grace window all held. Gotcha: `axe tap` takes ~10 s on the iOS 27 clone
 while streaming, which is environmental and unrelated to auth.
+
+---
+
+## 2026-09-30 — 5.2 (expiring per-share tokens)
+
+The single `TOKEN` constant became a `ShareRegistry` in a new pure module,
+`shares.js`: the operator's token (never expires) plus one random token per
+repeatable `--share [label=]<ttl>`. Expiry is defined once (`remaining()`), is
+reached when either the wall or the monotonic clock says so, and latches. The
+part the spec didn't spell out turned out to be the important one: `/stream`
+and `/ws` authorize only at connect, so an open tab would have outlived its
+link — connections are now tracked per share and closed at the deadline
+(`1008 "share expired"`; the client shows a toast and stops retrying). Review
+also changed credential precedence to "one channel decides" (query, else
+`x-token`, else cookie), because with fall-through an expired link still
+opened in the operator's own browser. Providers now return a token-free base
+URL and the server prints one link per share. Phase 5 (token & session
+hardening) is complete.
+
+Tests: first automated suite — `npm test`, 21 `node:test` cases on
+`shares.js`, each of 11 hand-made mutations killed. Live on a sandbox clone: a
+55-check curl/WebSocket matrix (incl. a raw socket that ignores the close
+frame), Chrome watching a share die at its deadline, and the `lan` provider
+opened from a bench iPhone. Gotchas: `simctl io screenshot` timed out (10 s) on
+the iOS 27 clone while streaming — the same environmental slowness 5.1 saw with
+`axe tap`;
+the Tailscale providers' one-line URL change was not exercised against a real
+tailnet.

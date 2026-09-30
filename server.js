@@ -6,13 +6,14 @@
 //   - WS /ws       — JSON input events (tap/swipe/type/button/key),
 //     dispatched as AXe commands through a FIFO queue.
 //
+// Access is by token: the operator's own plus any expiring `--share` tokens,
+// all held in the in-memory registry in shares.js.
+//
 // See README.md for the full architecture.
 
 import express from "express";
 import { WebSocketServer } from "ws";
 import { spawn, execFileSync } from "node:child_process";
-import { randomBytes, timingSafeEqual } from "node:crypto";
-import { Buffer } from "node:buffer";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import http from "node:http";
@@ -20,6 +21,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { getRemoteProvider } from "./remote.js";
+import { ShareRegistry, mintToken, parseShareSpec } from "./shares.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -27,8 +29,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Keeping this explicit means `--token --port 9090` fails loudly instead of
 // silently treating `token` as a boolean and eating the next flag.
 const VALUE_FLAGS = new Set([
-  "port", "host", "fps", "quality", "scale", "udid", "token", "auth", "remote",
+  "port", "host", "fps", "quality", "scale", "udid", "token", "auth", "remote", "share",
 ]);
+// Value flags that may be given more than once; these parse to an array.
+const REPEATABLE_FLAGS = new Set(["share"]);
 
 function parseArgs(argv) {
   const out = {};
@@ -41,7 +45,8 @@ function parseArgs(argv) {
       if (next === undefined || next.startsWith("--")) {
         throw new Error(`--${key} requires a value`);
       }
-      out[key] = next;
+      if (REPEATABLE_FLAGS.has(key)) (out[key] ??= []).push(next);
+      else out[key] = next;
       i++;
     } else {
       out[key] = "true";
@@ -58,17 +63,35 @@ const FPS = parseInt(args.fps || "15", 10);
 const QUALITY = parseInt(args.quality || "75", 10);
 const SCALE = parseFloat(args.scale || "0.5");
 const REQUIRE_AUTH = args.auth !== "false";
-const TOKEN = REQUIRE_AUTH ? (args.token || randomBytes(12).toString("hex")) : null;
-const TOKEN_BUF = TOKEN ? Buffer.from(TOKEN) : null;
 const REMOTE = getRemoteProvider(args.remote || null);
 
-function tokenMatches(provided) {
-  if (!TOKEN_BUF) return true;
-  if (typeof provided !== "string") return false;
-  const a = Buffer.from(provided);
-  if (a.length !== TOKEN_BUF.length) return false;
-  return timingSafeEqual(a, TOKEN_BUF);
+// Every token the server accepts lives in one in-memory registry (shares.js):
+// the operator's own, valid until the process exits, plus one expiring token
+// per `--share [label=]<ttl>`. `null` means auth is off.
+function buildShares() {
+  const specs = args.share || [];
+  if (!REQUIRE_AUTH) {
+    // Refuse rather than ignore: the operator asked for links that expire, and
+    // a server that is open to everyone would silently never honor that.
+    if (specs.length) throw new Error("--share needs auth — drop --auth false / --no-auth");
+    return null;
+  }
+  return new ShareRegistry({
+    ownerToken: args.token || mintToken(),
+    shares: specs.map(parseShareSpec),
+  });
 }
+
+let SHARES;
+try {
+  SHARES = buildShares();
+} catch (e) {
+  console.error(`[auth] ${e.message}`);
+  process.exit(1);
+}
+
+// What a request is authorized as when auth is off. Never expires.
+const NO_AUTH = Object.freeze({ label: "no-auth", expiresAt: null });
 
 // --- Credential channels ---------------------------------------------------
 //
@@ -77,7 +100,15 @@ function tokenMatches(provided) {
 // redirects), the `x-token` header (scripted access; never reaches a URL), and
 // the httpOnly cookie set by that handoff. Every entry point — the HTTP routes
 // AND the WebSocket upgrade — authorizes through `requestAuthorized()`, so the
-// channels cannot drift apart between check sites.
+// channels cannot drift apart between check sites. Expiry lives below all
+// three, in the registry: a dead share is dead on every channel at once.
+//
+// Exactly ONE credential is evaluated per request: `?token=` if the request
+// carries one, otherwise `x-token`, otherwise the cookie — with no falling
+// through. A link must behave the same in every browser; if a dead `?token=`
+// could ride on a cookie that happens to be valid, an expired share link would
+// still open for the operator (whose browser holds the owner cookie), which is
+// precisely the person checking whether it died.
 //
 // Cookies are scoped by host, not port, so the name carries the port: two
 // servers on one machine would otherwise overwrite each other's cookie.
@@ -94,19 +125,52 @@ function readCookie(req, name) {
   return undefined;
 }
 
+// Returns the registry entry the request is authorized as, or null.
+// `queryToken` is undefined when the URL has no `token` parameter; anything
+// else — including an empty string — counts as presented and must match.
 function requestAuthorized(req, queryToken) {
-  if (!REQUIRE_AUTH) return true;
-  return [queryToken, req.headers["x-token"], readCookie(req, AUTH_COOKIE)].some(tokenMatches);
+  if (!SHARES) return NO_AUTH;
+  const presented = queryToken ?? req.headers["x-token"] ?? readCookie(req, AUTH_COOKIE);
+  return SHARES.match(presented);
 }
 
-function authCookieHeader(req) {
+// Tie a long-lived connection to the share that authorized it, so the share's
+// expiry ends it. Returns the untrack function for the connection's close.
+function trackSession(share, close) {
+  return SHARES ? SHARES.track(share, close) : () => {};
+}
+
+function shareLive(share) {
+  return !SHARES || SHARES.isLive(share);
+}
+
+function authCookieHeader(req, share) {
   // `Secure` only when the browser is actually on https (directly or through a
   // TLS-terminating tunnel such as Tailscale Serve); on plain http a Secure
   // cookie is silently dropped and the redirect would land unauthenticated.
   // `SameSite=Lax`, not Strict: the link is usually opened from another app,
   // and Strict would withhold the cookie on that cross-site redirect.
   const https = req.secure || req.headers["x-forwarded-proto"] === "https";
-  return `${AUTH_COOKIE}=${encodeURIComponent(TOKEN)}; Path=/; HttpOnly; SameSite=Lax${https ? "; Secure" : ""}`;
+  // The cookie holds the token that was actually presented, and lives exactly
+  // as long as that share does (the owner's stays a session cookie). Rounded
+  // up: the server is the authority on expiry, so a cookie that lingers for a
+  // fraction of a second is harmless, while `Max-Age=0` would delete it and
+  // turn the redirect into a 401 for a link that is still valid.
+  const left = SHARES.remaining(share);
+  const maxAge = Number.isFinite(left) ? `; Max-Age=${Math.max(1, Math.ceil(left / 1000))}` : "";
+  return `${AUTH_COOKIE}=${encodeURIComponent(share.value)}; Path=/; HttpOnly; SameSite=Lax${maxAge}${https ? "; Secure" : ""}`;
+}
+
+// Human-readable lifetime for the startup banner, e.g. "2h" or "1d 3h".
+function formatTtl(ms) {
+  const parts = [];
+  let rest = Math.round(ms / 1000);
+  for (const [unit, size] of [["d", 86400], ["h", 3600], ["m", 60], ["s", 1]]) {
+    const n = Math.floor(rest / size);
+    if (n > 0) parts.push(`${n}${unit}`);
+    rest -= n * size;
+  }
+  return parts.join(" ") || "0s";
 }
 
 // --- Simulator discovery ---------------------------------------------------
@@ -500,9 +564,16 @@ async function main() {
   const htmlTemplate = fs.readFileSync(path.join(__dirname, "public", "index.html"), "utf8");
   const renderedHtml = htmlTemplate.replace("__ASPECT__", `${bounds.w} / ${bounds.h}`);
 
+  // A `token` parameter that is present but not a plain string (`?token=a&token=b`
+  // parses to an array) is still *presented* — it becomes "", which never matches.
+  const queryToken = (req) => {
+    const q = req.query.token;
+    return q === undefined || typeof q === "string" ? q : "";
+  };
+
   const authCheck = (req, res, next) => {
-    const q = typeof req.query.token === "string" ? req.query.token : undefined;
-    if (requestAuthorized(req, q)) return next();
+    req.share = requestAuthorized(req, queryToken(req));
+    if (req.share) return next();
     return res.status(401).type("text/plain").send("Unauthorized");
   };
 
@@ -511,9 +582,11 @@ async function main() {
     // URL gets the cookie and a redirect to the same URL without it, so the
     // credential leaves the address bar before the page ever renders.
     const original = new URL(req.originalUrl, "http://x");
-    if (REQUIRE_AUTH && original.searchParams.has("token")) {
+    if (SHARES && original.searchParams.has("token")) {
       original.searchParams.delete("token");
-      res.setHeader("Set-Cookie", authCookieHeader(req));
+      // A request with `?token=` is authorized by that token and nothing else
+      // (see requestAuthorized), so req.share is the share the link belongs to.
+      res.setHeader("Set-Cookie", authCookieHeader(req, req.share));
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Referrer-Policy", "no-referrer");
       return res.redirect(302, original.pathname + original.search);
@@ -531,6 +604,10 @@ async function main() {
       "X-Accel-Buffering": "no",
     });
     hub.addClient(res);
+    // Authorization happened once, at connect; this is what ends the stream
+    // when the share behind it expires. destroy() fires "close", which is also
+    // how the hub drops the client and keeps its refcount right.
+    res.on("close", trackSession(req.share, () => res.destroy()));
   });
 
   const server = http.createServer(app);
@@ -548,17 +625,27 @@ async function main() {
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (url.pathname !== "/ws") return socket.destroy();
-    if (!requestAuthorized(req, url.searchParams.get("token") ?? undefined)) {
+    const share = requestAuthorized(req, url.searchParams.get("token") ?? undefined);
+    if (!share) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       return socket.destroy();
     }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req, share));
   });
 
-  wss.on("connection", (ws) => {
+  // 1008 (policy violation) is one of the two codes the client reads as "your
+  // credential is bad"; the reason lets it say *why* and stop retrying.
+  const expireSocket = (ws) => ws.close(1008, "share expired");
+
+  wss.on("connection", (ws, _req, share) => {
     console.log("[ws] connected");
+    ws.on("close", trackSession(share, () => expireSocket(ws)));
     safeSend(ws, { type: "hello", simulator: sim, bounds, stream: hub.status });
     ws.on("message", async (raw) => {
+      // Checked per message, not just by the expiry sweep: close() only starts
+      // a handshake, and a client that never answers it keeps the socket
+      // readable until ws gives up. No input is dispatched past expiry.
+      if (!shareLive(share)) return expireSocket(ws);
       let evt;
       try {
         evt = JSON.parse(raw.toString());
@@ -589,24 +676,41 @@ async function main() {
   let remoteEndpoint = null;
   if (REMOTE?.start) {
     try {
-      remoteEndpoint = await REMOTE.start({ port: PORT, token: TOKEN });
+      remoteEndpoint = await REMOTE.start({ port: PORT });
     } catch (e) {
       console.error(`[remote:${REMOTE.name}] ${e.message}`);
       process.exit(1);
     }
   }
 
+  // Providers return a token-free base URL; the server is the only thing that
+  // knows about tokens, and turns each base into one link per registry entry.
   const hostShown = bindHost === "0.0.0.0" ? "localhost" : bindHost;
-  const localUrl = `http://${hostShown}:${PORT}/${TOKEN ? `?token=${TOKEN}` : ""}`;
+  const localBase = `http://${hostShown}:${PORT}/`;
+  const link = (base, share) => (share ? `${base}?token=${encodeURIComponent(share.value)}` : base);
+  const owner = SHARES?.owner ?? null;
   console.log("");
   console.log("  sim-stream running");
-  console.log(`  local:     ${localUrl}`);
+  console.log(`  local:     ${link(localBase, owner)}`);
   if (remoteEndpoint) {
     const label = `${REMOTE.name}:`.padEnd(10);
-    if (remoteEndpoint.url) console.log(`  ${label} ${remoteEndpoint.url}`);
+    if (remoteEndpoint.url) console.log(`  ${label} ${link(remoteEndpoint.url, owner)}`);
     if (remoteEndpoint.note) console.log(`             ${remoteEndpoint.note}`);
   }
-  if (TOKEN) console.log(`  token:     ${TOKEN}`);
+  if (owner) console.log(`  token:     ${owner.value}  (yours — never expires; restart to revoke)`);
+  if (SHARES) {
+    // Share links are for handing out, so they use the remote URL when there
+    // is one.
+    const shareBase = remoteEndpoint?.url || localBase;
+    for (const share of SHARES.entries.slice(1)) {
+      const until = new Date(share.expiresAt).toLocaleString();
+      console.log(`  share:     ${share.label} — valid ${formatTtl(share.ttlMs)}, until ${until}`);
+      console.log(`             ${link(shareBase, share)}`);
+    }
+    SHARES.watch(({ entry, closed }) => {
+      console.log(`[auth] share "${entry.label}" expired — closed ${closed} open connection${closed === 1 ? "" : "s"}`);
+    });
+  }
   console.log(`  simulator: ${sim.name} (${sim.udid})`);
   console.log(`  stream:    ${FPS}fps scale=${SCALE} quality=${QUALITY}`);
   console.log("");
@@ -617,6 +721,7 @@ async function main() {
     shuttingDown = true;
     console.log("\n[shutdown] cleaning up...");
     hub.stop();
+    SHARES?.stop();
     if (REMOTE?.stop) {
       try { await REMOTE.stop(); } catch {}
     }

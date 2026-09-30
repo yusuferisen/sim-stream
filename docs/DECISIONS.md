@@ -292,3 +292,60 @@ page load is a navigation that lands in the address bar and history).
 
 **Cost accepted:** a browser that blocks cookies for the host now gets `401`
 after the redirect instead of working from the URL.
+
+---
+
+## 2026-09-30 — Share-token mechanics (5.2)
+
+Builds on *Share tokens: in-memory registry, minted at startup (5.2)* above,
+which fixed the shape; these are the choices made while building it.
+
+**Chose:**
+
+- **`--share [label=]<ttl>`, repeatable, unit mandatory** (`45s`, `30m`, `2h`,
+  `1d`; max `365d`). A bare `30` is an error, not "30 hours": guessing the
+  unit wrong in the long direction is the exact failure expiry exists to
+  prevent. Labels default to `share-N`, must be unique, and `owner` is
+  reserved.
+- **The operator's own token stays process-lifetime.** It is registry entry 0
+  with no expiry. Shares are for other people; the operator's link dying
+  mid-session would be self-inflicted friction, and a restart already revokes
+  it.
+- **Expiry ends open connections.** `/stream` and `/ws` authorize once at
+  connect, so without this an open tab keeps watching and driving the simulator
+  indefinitely after its link "expired" — the link would be dead only for
+  people who hadn't opened it yet. Each long-lived connection is tracked
+  against its share and closed at the deadline (MJPEG destroyed, WebSocket
+  `1008 "share expired"`), and input is re-checked per message.
+- **Dead when either clock says so, and it latches.** Wall clock (what the
+  banner promised; keeps counting through machine sleep) *or* monotonic clock
+  (can't be set back). Once observed expired, an entry never revives. Every
+  clock anomaly therefore shortens a share, never extends it.
+- **One credential decides each request** — `?token=` if present, else
+  `x-token`, else the cookie, no fall-through. This amends the 5.1 (cookie
+  handoff) behaviour, where any matching channel was enough. With expiry that
+  rule had a trap: the operator's browser holds the owner cookie, so an
+  expired share link would still open *for the operator* — the one person
+  checking whether it died. Now a dead `?token=` is `401` everywhere.
+- **Providers return a token-free base URL.** `start({port}) → {url, note}`;
+  the server appends `?token=…` per link. One link per share made "the
+  provider formats the URL" untenable, and providers no longer see a secret at
+  all.
+- **The share clock starts at process start.** Tokens are minted during
+  argument validation, before simulator boot. A slow boot shortens the share
+  slightly (safe direction); the banner prints the absolute deadline.
+- **A `node:test` suite for `shares.js`.** The registry was written as a pure,
+  import-safe module so its boundary conditions can be tested without a
+  simulator. Built-in runner, no new dependency.
+
+**Rejected:** a bare number meaning hours (silent mis-set); a TTL on the owner
+token (a second way to lock yourself out, no new safety); a periodic sweep
+alone (up to a second of post-expiry input — hence the per-message check);
+`ws.terminate()` instead of `close(1008)` (the client could not tell "expired"
+from a network drop, and would retry forever); letting a valid cookie rescue a
+dead link token (see above); `--share` silently ignored under `--auth false`
+(now a startup error).
+
+**Cost accepted:** no per-share revocation and no extension — restart is the
+only lever, and it revokes the operator's link too. A stale bookmark carrying
+an old `?token=` now gets `401` even if the browser still has a good cookie.

@@ -6,8 +6,11 @@
 // changes required.
 //
 //   prepare()                -> { host? }                    // before listen()
-//   start({ port, token })   -> { url, note? } | Promise     // after  listen()
+//   start({ port })          -> { url, note? } | Promise     // after  listen()
 //   stop()                   -> void | Promise               // on shutdown
+//
+// `url` is the token-free base URL, ending in "/". Providers know nothing
+// about auth: the server appends `?token=…` itself, once per share link.
 //
 // Every hook is OPTIONAL — the server calls each through optional chaining, so
 // a provider implements only what it needs (`lan` has no stop()). But one that
@@ -73,7 +76,7 @@ function tailscaleProvider(mode) {
     prepare() {
       return { host: "127.0.0.1" };
     },
-    start({ port, token }) {
+    start({ port }) {
       const ts = tailscaleBinary();
       const host = tailscaleHostname(ts);
       ensureMacGuiRunning();
@@ -93,7 +96,7 @@ function tailscaleProvider(mode) {
         // visit: https://login.tailscale.com/f/serve?node=…").
         throw new Error(`tailscale ${mode} failed:\n${stderr}`);
       }
-      const url = `https://${host}/${token ? `?token=${token}` : ""}`;
+      const url = `https://${host}/`;
       const note = mode === "funnel"
         ? "PUBLIC — anyone with this URL + token can reach your simulator."
         : "Private to your tailnet (devices signed in to your Tailscale account).";
@@ -129,10 +132,10 @@ const PROVIDERS = {
     prepare() {
       return { host: "0.0.0.0" };
     },
-    start({ port, token }) {
+    start({ port }) {
       const ip = primaryLanIp();
       if (!ip) return { url: null, note: "Could not detect a LAN IP — check `ifconfig`." };
-      const url = `http://${ip}:${port}/${token ? `?token=${token}` : ""}`;
+      const url = `http://${ip}:${port}/`;
       return { url, note: "Reachable from devices on the same Wi-Fi / LAN." };
     },
   },

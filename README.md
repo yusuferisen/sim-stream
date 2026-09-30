@@ -54,6 +54,7 @@ npm install
 ./scripts/start.sh --port 9090              # custom port
 ./scripts/start.sh --remote lan             # expose on the LAN
 ./scripts/start.sh --remote tailscale-serve # private HTTPS over your tailnet
+./scripts/start.sh --share demo=2h          # also mint a link that expires in 2h
 ./scripts/start.sh --no-auth                # disable token auth (local only!)
 ```
 
@@ -68,12 +69,45 @@ it, so the token leaves the address bar and browser history:
 ```
 sim-stream running
   local:     http://127.0.0.1:8080/?token=a3f9…
-  token:     a3f94c...
+  token:     a3f94c...  (yours — never expires; restart to revoke)
   simulator: iPhone 17 Pro Max (3B76...)
   stream:    15fps scale=0.5 quality=75
 ```
 
 Open the URL in any browser. You should see the live simulator screen.
+
+### Share links that expire
+
+The token above is **yours**: it works until the server process exits. To hand
+someone else access, mint a separate link with a lifetime instead of sharing
+your own:
+
+```sh
+./scripts/start.sh --remote tailscale-funnel --share demo=2h --share qa=30m
+```
+
+```
+  share:     demo — valid 2h, until 9/30/2026, 5:42:10 PM
+             https://<host>.<tailnet>.ts.net/?token=91c0…
+  share:     qa — valid 30m, until 9/30/2026, 4:12:10 PM
+             https://<host>.<tailnet>.ts.net/?token=5be2…
+```
+
+- `--share [label=]<ttl>` is repeatable. The TTL is a whole number plus a unit
+  — `45s`, `30m`, `2h`, `1d` (max `365d`); a bare number is rejected rather
+  than guessed at. Without a label the share is named `share-1`, `share-2`, ….
+- Each share gets its own random token. Share links are printed on the
+  `--remote` URL when there is one, otherwise on the local URL.
+- The clock starts when the server process starts; the printed "until" time is
+  the exact deadline.
+- When a share expires it stops working on every channel at once — the link,
+  the cookie it left in a browser, and the `x-token` header — and the server
+  **closes the connections it had open**: the video stream ends and the page
+  shows "This share link has expired". An already-open tab does not keep
+  working.
+- Shares live in memory only. There is no way to extend one or mint a new one
+  while the server runs; **restarting the server revokes every link**, yours
+  included.
 
 ### Remote access
 
@@ -115,13 +149,16 @@ still pass `--host` directly if you need full control.
 Keep the token secret — it's the only thing gating access when exposed.
 For `tailscale-funnel` especially: the URL is publicly reachable; the
 token is your only auth. The printed link still carries it, so share it
-deliberately; once opened, the browser holds it only in an httpOnly cookie
-(scoped to the port, cleared when the browser session ends).
+deliberately — and prefer handing out a [`--share`](#share-links-that-expire)
+link, which dies on its own, over your own token, which doesn't. Once opened,
+the browser holds the token only in an httpOnly cookie (scoped to the port;
+cleared when the browser session ends, or when the share expires).
 
 ### Adding new remote providers
 
 `remote.js` exposes a tiny provider interface — `prepare` (advise a bind
-host), `start` (bring the tunnel up, return the URL to print), and `stop`
+host), `start` (bring the tunnel up, return the token-free base URL; the
+server appends `?token=…` itself, once per link it prints), and `stop`
 (tear it down). All three are optional: implement only what you need, but a
 provider that spawns a long-lived process needs `stop` or it leaks past exit.
 To add e.g. a Cloudflare quick tunnel, drop a new entry into the `PROVIDERS`
@@ -160,7 +197,8 @@ All flags can be passed to `scripts/start.sh` or to `node server.js` directly:
 | `--quality <N>`  | `75`        | JPEG quality (1–100)                          |
 | `--scale <N>`    | `0.5`       | Frame size multiplier (0.1–1.0)               |
 | `--udid <UDID>`  | auto        | Specific simulator UDID                       |
-| `--token <str>`  | random hex  | Auth token. Every route and the WebSocket accept `?token=…`, an `x-token` header (scripts), or the httpOnly cookie set when the page is opened |
+| `--token <str>`  | random hex  | Your own auth token — valid until the process exits. Every route and the WebSocket accept a token as `?token=…`, an `x-token` header (scripts), or the httpOnly cookie set when the page is opened. One credential is checked per request: the query if present, else the header, else the cookie |
+| `--share [label=]<ttl>` | —    | Mint an extra link that expires after `<ttl>` (`45s`, `30m`, `2h`, `1d`). Repeatable. See [Share links that expire](#share-links-that-expire) |
 | `--auth false`   | on          | Disable auth (local only)                     |
 | `--no-auth`      | —           | Same as `--auth false` (start.sh shorthand)   |
 | `--remote <p>`   | —           | Remote-access provider: `lan`, `tailscale-serve`, `tailscale-funnel` |
@@ -198,6 +236,8 @@ at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
 | Path                      | Purpose                                                              |
 |---------------------------|----------------------------------------------------------------------|
 | `server.js`               | Node.js server: HTTP, WS, MJPEG hub, AXe command queue, auth         |
+| `shares.js`               | The token registry: your token plus expiring share tokens            |
+| `test/shares.test.js`     | Unit tests for the registry (`npm test`; no simulator needed)        |
 | `remote.js`               | Pluggable remote-access providers (LAN / Tailscale Serve / Funnel)   |
 | `public/index.html`       | Single-page client: MJPEG `<img>`, pointer/gesture detection, toolbar |
 | `scripts/start.sh`        | Dev launcher: checks AXe, installs deps, boots simulator, runs server |
@@ -230,6 +270,12 @@ the header should be green. If it's red, the WebSocket couldn't
 authenticate — reopen the printed `?token=…` link. The page itself relies
 on a cookie, so a browser that blocks cookies for the host gets `401` after
 the redirect.
+
+**"This share link has expired" / a link answers `Unauthorized`** — the
+`--share` lifetime ran out, or the server was restarted (every restart mints
+new tokens). A link with a dead `?token=` is refused even in a browser that
+still holds a valid cookie, so an expired link looks expired to you too.
+Restart with a fresh `--share` to issue a new one.
 
 **Stream freezes after a while** — the underlying AXe process likely
 crashed. Reload the page; the server will respawn it on the next connect.

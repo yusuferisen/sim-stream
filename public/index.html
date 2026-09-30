@@ -376,6 +376,14 @@
     ws.onclose = (e) => {
       wsReady = false;
       wsDot.classList.remove("ok"); wsDot.classList.add("bad");
+      // The server ends every connection a share link authorized the moment
+      // that link expires. Retrying cannot succeed — the cookie is dead too —
+      // so say so once and stop.
+      if (e && e.code === 1008 && e.reason === "share expired") {
+        streamDot.classList.remove("ok"); streamDot.classList.add("bad");
+        toast("This share link has expired", "bad");
+        return;
+      }
       // 1008 and 1006 for close-before-open on auth fail; surface once.
       if (e && (e.code === 1006 || e.code === 1008) && wsBackoffMs === 1500) {
         toast("Input connection failed — check auth token", "bad");

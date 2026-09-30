@@ -7,6 +7,8 @@ input, via the AXe CLI. Single surface at the repo root (no surface folders).
 
 ```
 server.js            HTTP + WebSocket + MJPEG hub + AXe command queue + auth
+shares.js            Token registry — owner token + expiring --share tokens (pure, unit-tested)
+test/                node:test suite (shares.js only)
 remote.js            Remote-access providers (prepare/start/stop), --remote <name>
 public/index.html    The entire client — markup, styles, script in one file
 scripts/start.sh     Dev launcher: checks AXe, installs deps, boots the sim
@@ -16,7 +18,8 @@ docs/                PRD · ROADMAP · OVERVIEW · JOURNAL · DECISIONS · archi
 
 ## Build / run / test contract
 
-There is no build step and no automated test suite — see below.
+There is no build step. `npm test` covers only `shares.js` (the token
+registry); everything else is verified by hand — see below.
 
 ```sh
 npm install                                  # deps: express, ws
@@ -24,12 +27,14 @@ npm install                                  # deps: express, ws
 ./scripts/start.sh --list                    # list simulators, exit
 ./scripts/start.sh --udid <UDID>             # pin to one simulator
 ./scripts/start.sh --remote lan              # reachable on the LAN
+./scripts/start.sh --share demo=2h           # also mint an expiring link
 node server.js --port 9090                   # server directly; same flags
-node --check server.js && node --check remote.js   # syntax gate
+node --check server.js && node --check remote.js && node --check shares.js   # syntax gate
+npm test                                     # node --test — shares.js unit tests, no simulator
 ```
 
-**Verification is manual and requires a booted simulator plus `axe` on the
-host** — nothing here runs in CI. The phase gate is the browser checklist in
+**Beyond `npm test`, verification is manual and requires a booted simulator
+plus `axe` on the host** — nothing here runs in CI. The phase gate is the browser checklist in
 `docs/architecture.md` § Testing strategy: start the server, open the URL,
 exercise tap / swipe / long-press / typing / a hardware button / screenshot,
 reload to confirm the 5 s grace window doesn't respawn AXe, and narrow the

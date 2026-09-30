@@ -42,9 +42,9 @@
   - [x] 3.2 `lan`, `tailscale-serve`, and `tailscale-funnel` providers
 - [x] **Phase 4 — Build-vs-adopt evaluation**
   - [x] 4.1 SimCast evaluation — verdict: keep `sim-stream`
-- [ ] **Phase 5 — Token & session hardening**
+- [x] **Phase 5 — Token & session hardening**
   - [x] 5.1 Cookie handoff → both check sites share one `requestAuthorized()`; the WS upgrade now also accepts `x-token`
-  - [ ] 5.2 Expiring per-share tokens — in-memory registry (value, expiry, label) minted at startup, replacing the single constant [model: fable]
+  - [x] 5.2 Expiring per-share tokens → `--share [label=]<ttl>`; expiry also closes open connections, and one credential decides per request [model: fable]
 - [ ] **Phase 6 — Cloudflare quick tunnel**
   - [ ] 6.1 `cloudflared` provider — anonymous quick tunnel, mandatory `stop`; verify the edge does not buffer MJPEG
 - [ ] 🏁 **MILESTONE: Safe public sharing** ← default stop point
@@ -62,26 +62,25 @@
 
 ## Current Status
 
-- **Current phase / sub-phase:** 5.2 — expiring per-share tokens
+- **Current phase / sub-phase:** 6.1 — `cloudflared` quick-tunnel provider
 - **State:** not-started
-- **Last completed:** 5.1 (cookie handoff — token leaves the address bar on first load)
-- **Build:** green (`node --check`) · **Tests:** n/a (no suite) · **Simulator-verified:** yes (sandbox clone: redirect, httpOnly cookie, stream, WS input, reload grace window)
+- **Last completed:** 5.2 (expiring share links — `--share demo=2h`; Phase 5, token & session hardening, is done)
+- **Build:** green (`node --check` ×3) · **Tests:** 21/21 (`npm test` — covers `shares.js` only) · **Simulator-verified:** yes (sandbox clone: 55-check auth/expiry matrix, Chrome watching a share expire, `lan` link opened from a bench iPhone)
 
 ---
 
 ## Next Concrete Action
 
-> Implement 5.2 (expiring per-share tokens) on **Fable** — it is tagged
-> `[model: fable]`, so a run on any other model halts here by design.
-> In `server.js`, replace `TOKEN`/`TOKEN_BUF` with an in-memory registry of
-> `{value, expiry, label}` minted at startup from repeatable flags;
-> `tokenMatches()` walks it (constant-time per entry) and rejects expired entries.
-> `requestAuthorized()` is the single check point for query, `x-token`, and the
-> cookie, so expiry applies to all three channels once `tokenMatches` knows it.
-> Set the handoff cookie's `Max-Age` to the matched share's remaining lifetime,
-> and make the cookie store the *matched* token (today `authCookieHeader` writes
-> the constant `TOKEN`). Print one URL per share at startup; update `remote.js`
-> `start({token})` callers to match.
+> Implement 6.1 (`cloudflared` anonymous quick tunnel) as one new entry in
+> `remote.js`'s `PROVIDERS` map: `prepare` → `{host: "127.0.0.1"}`; `start({port})`
+> spawns `cloudflared tunnel --url http://127.0.0.1:<port>`, parses the
+> `trycloudflare.com` hostname from its output, and returns the **token-free**
+> base URL (`https://<host>/`) — the server appends `?token=…` per link;
+> `stop` kills the child (mandatory). A missing binary fails at once with the
+> install command. Then verify against a real tunnel that Cloudflare's edge
+> does not buffer the MJPEG stream, and that a short `--share` still cuts the
+> stream at its deadline through the tunnel.
+> 6.1 carries no model tag: an autopilot run still on Fable halts here by design; `/pilot` routes it down to Opus.
 
 ---
 
@@ -91,6 +90,9 @@
 - **When is ~7–10 fps no longer good enough to justify Phase 7?** → chose **defer until animation or scroll review actually blocks a check** → DECISIONS.md § Build vs. adopt (phase 7)
 - **Does a screenshot gallery stay local or sync across devices?** → chose **local filesystem only** → DECISIONS.md § Build vs. adopt (phase 8)
 - **Multi-simulator support** → chose **out of scope; one simulator per server** → DECISIONS.md § Build vs. adopt
+- **Share lifetime syntax (5.2, expiring share links)** → chose **`--share [label=]<ttl>` with a mandatory unit; a bare number is an error** → DECISIONS.md § Share-token mechanics (5.2)
+- **A dead link token vs. a still-valid cookie (5.2)** → chose **the link decides: `401`, even in the operator's own browser** (amends 5.1, cookie handoff) → DECISIONS.md § Share-token mechanics (5.2)
+- **Revoking or extending one share (5.2)** → chose **not supported; restart revokes everything, the operator's own never-expiring token included** → DECISIONS.md § Share-token mechanics (5.2)
 
 ---
 
@@ -107,15 +109,15 @@ rather than here — it blocks a post-milestone phase, not the run.
 
 ## Assumptions & Risks
 
-- **No automated test suite.** Every path needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is the manual browser checklist in `docs/architecture.md` § Testing strategy.
+- **Automated tests cover only `shares.js`** (`npm test`, the token registry). Every other path needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is still the manual browser checklist in `docs/architecture.md` § Testing strategy.
 - **Host prerequisites:** macOS with Xcode simulators, `axe` (`brew install cameroncooke/axe/axe`), Node 18+.
 - **`boundsForDeviceType()` is a hand-maintained table.** A simulator model missing from it mis-maps taps silently — check `/api/info` bounds first when taps land wrong.
-- **The token never expires.** It leaves the address bar on first load (5.1), but the shared link still carries it and it stays valid for the process lifetime — 5.2 (expiring share tokens) closes this.
-- **`axe tap` is slow on the iOS 27 sandbox clone while streaming** (~10 s direct, vs. the queue's 5 s timeout), so taps time out there; buttons ack fine. Observed during 5.1 verification, predates it — recheck on the home phone before blaming the queue.
+- **The operator's own token still never expires** within a run, and it is the one on the `local:` / `--remote` banner lines. Only `--share` links die on their own — hand those out, not the top link.
+- **Tailscale providers were not re-run after 5.2 (expiring share links) changed the provider contract** (`start` now returns a token-free URL). `lan` was verified from a real phone and the Tailscale edit is the same one-line shape, but check the printed links on the next `tailscale-serve`/`-funnel` use.
+- **The iOS 27 sandbox clone is slow while streaming:** `axe tap` timed out there in 5.1 (cookie handoff) verification (~10 s vs. the queue's 5 s) and `simctl io screenshot` in 5.2 (expiring share links) verification (past its 10 s); hardware buttons ack fine. Environmental and older than both phases — recheck on the home phone before blaming the queue.
 - **Cloudflare's edge may buffer `multipart/x-mixed-replace`.** Test an actual tunnel before recommending either Phase 6 provider over Tailscale.
 - **`docs/OVERVIEW.md` and `docs/architecture.md` were inferred by `/adopt` on 2026-07-31** from the code — their claims were source-verified in review, but they describe intent they weren't written from.
 - **Phase 6b needs a domain on a Cloudflare account** (plus a named tunnel and an Access policy) before it can be built or verified. It sits past the milestone for exactly this reason; a run reaching it should halt.
-- **5.2 is tagged `[model: fable]`** — API-priced, outside the subscription. Expect **two** halts around it, both correct: a run on any other model halts *entering* 5.2 (mismatch), and a run continuing on Fable halts *leaving* it, because the reverse guard stops Fable rolling onto untagged 6.1. Neither is a malfunction.
 
 ---
 
