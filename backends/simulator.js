@@ -267,7 +267,7 @@ function runScreenshot(udid, dest) {
 // Echoes a child's stderr line by line under `prefix`, minus lines matching
 // `skip`. A child that never ends its line must not grow the buffer without
 // bound.
-function relayStderr(stream, prefix, skip) {
+export function relayStderr(stream, prefix, skip) {
   let partial = "";
   stream.on("data", (d) => {
     const lines = (partial + d.toString()).split("\n");

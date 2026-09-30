@@ -78,7 +78,7 @@ flowchart TB
     shot -- "xcrun simctl io screenshot" --> sim
     axe --> sim
     sim -- "frames" --> axe
-    src -. "--device: GET WDA MJPEG via ios forward" .-> wda["WebDriverAgent<br/>on a bench device"]
+    src -. "--device: GET WDA MJPEG via ios forward (twice for H.264: body piped into the helper's stdin)" .-> wda["WebDriverAgent<br/>on a bench device"]
     shot -. "--device: WDA /screenshot · /window/size" .-> wda
     queue -. "--device: WDA /actions · /wda/keys · /elements · /wda/homescreen" .-> wda
     hub -. "status: idle | live | dead (broadcast to all WS)" .-> ptr
@@ -92,8 +92,9 @@ There is no database and nothing persists between runs. The only durable
 artifacts are screenshots written to `~/Desktop/sim-stream/` (plus their
 cached thumbnails in `.thumbs/` there). What the system holds is
 process state — the capture process below, and the token registry after it.
-The H.264 hub runs the same state machine over its own pipeline (AXe plus the
-encoder helper), independently of the MJPEG one:
+The H.264 hub runs the same state machine over its own pipeline (AXe — or, on
+a device, a GET of WDA's MJPEG — plus the encoder helper), independently of
+the MJPEG one:
 
 ```mermaid
 stateDiagram-v2
@@ -130,7 +131,7 @@ stateDiagram-v2
 
 Per-run configuration, resolved once at startup and never mutated: `PORT`,
 `HOST`, `FPS`, `QUALITY`, `SCALE`, the backend (which simulator or device, its logical
-`bounds`, whether the H.264 path exists — helper built, screen size measured —
+`bounds`, whether the H.264 path exists — helper built, picture size measured (a screenshot, or a device's first JPEG) —
 and its picture size), and the set of tokens (the registry gains no entries after startup; shares
 only expire out of it).
 
@@ -164,7 +165,10 @@ its WDA port through `qa-device`; `--device <udid> --wda <url>` works without
 it). The server checks WDA, names the device from go-ios (`MGL-QA-16E`), sets
 WDA's stream to the `--fps`/`--scale`/`--quality` flags (30 fps by default
 here), forwards the device's MJPEG port with `ios forward`, and serves the
-same page, links and shares — the picture runs at ~28 fps. Input goes
+same page, links and shares — the picture runs at ~28 fps. With the helper
+built the page plays it as H.264 (~26 fps at ~2 Mbit/s; MJPEG is ~30 Mbit/s):
+the server measures WDA's picture from its first JPEG and pipes a second copy
+of the stream into the helper. Input goes
 through WDA, one command at a time: touches as W3C pointer actions (~1 s per
 tap on the 16e), text and Return/Backspace/Tab/Space through `/wda/keys`
 (Unicode works), Home via `/wda/homescreen`, Lock via `/wda/lock`, tap by label
@@ -251,8 +255,9 @@ Known and accepted, not defects:
 - **Single touch.** No pinch, no rotate, no multi-finger gestures.
 - **One target per server.** A simulator or a device, fixed at startup;
   `--device` and `--udid` refuse each other.
-- **A device is MJPEG-only for now, and slower to drive.** No H.264 from a
-  device yet. WDA answers a touch once the app is idle (~1 s a tap); Home
+- **A device is slower to drive, and its H.264 tops out near WDA's rate.**
+  H.264 from a device is re-encoded WDA MJPEG, so it runs at what WDA
+  delivers (~26 fps under motion, 30 when still). WDA answers a touch once the app is idle (~1 s a tap); Home
   pressed on the home screen answers only after ~10 s, holding the queue; the
   Lock button times out on the iOS 26 bench (WDA cannot lock it). A device that
   auto-locks shows its lock screen until the next input unlocks it.

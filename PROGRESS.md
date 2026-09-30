@@ -9,7 +9,7 @@
 
 - **Project:** sim-stream
 - **Target milestone:** Safe public sharing — stop here for review
-- **Status:** `continue`
+- **Status:** `milestone-reached`
 - **Updated:** 2026-09-30
 
 ---
@@ -59,45 +59,33 @@
   - [x] 8.2 Tap by accessibility label
 - [ ] **Phase 8b — `ngrok` provider (needs the owner's ngrok account)**
   - [ ] 8b.1 `ngrok` provider — same provider shape as 6.1; authtoken from the environment, never a repo file
-- [ ] **Phase 9 — Real-device backend (WebDriverAgent)**
+- [x] **Phase 9 — Real-device backend (WebDriverAgent)**
   - [x] 9.1 Backend seam → `backends/simulator.js` + `mjpeg.js`; checklist passed on a clone [model: fable]
   - [x] 9.2 Device video → `backends/device.js`; ~28 fps from the primary bench iPhone
   - [x] 9.3 Device input → Home via `/wda/homescreen`, Siri refused (WDA has no working equivalent on the bench)
-  - [ ] 9.4 H.264 for devices — helper `--input mjpeg`; `/video` from the device at ≥25 fps and a few Mbit/s
+  - [x] 9.4 H.264 for devices → 26 fps at 1.7 Mbit/s from the primary bench iPhone
 
 ---
 
 ## Current Status
 
-- **Current phase / sub-phase:** 9.4 — H.264 for devices (real-device backend, Phase 9)
-- **State:** not-started
-- **Last completed:** 9.3 (device input) — the primary bench iPhone is drivable from Chrome (touches, text, keys, Home, tap by label, wake from auto-lock); the 🏁 Safe public sharing milestone still awaits the owner's review before its box is ticked
-- **Build:** green (`node --check` ×10) · **Tests:** 149/149 `npm test` + 11 `swift test` · **Device-verified:** yes (9.3: primary bench iPhone 16e from Chrome — tap, swipes, long-press, Unicode text, Backspace/Return, Home, label hit + miss, refusal toasts, screenshot, auto-lock wake)
+- **Current phase / sub-phase:** none in progress — Phase 9 (real-device backend) is complete; the 🏁 Safe public sharing milestone awaits the owner's review
+- **State:** done
+- **Last completed:** 9.4 (H.264 for devices) — the primary bench iPhone plays as H.264 in Chrome (~26 fps under motion, 1.7 Mbit/s vs 30 Mbit/s MJPEG); MJPEG fallback without the helper confirmed
+- **Build:** green (`node --check` ×10) · **Tests:** 156/156 `npm test` + 22 `swift test` · **Device-verified:** yes (9.4: primary bench iPhone 16e — `/video` probe while swiping, Chrome header `H.264` at 25 fps decoded, MJPEG viewer alongside, helper moved aside → `MJPEG`; simulator H.264 re-checked on a clone)
 
 ---
 
 ## Next Concrete Action
 
-> Implement 9.4 (H.264 for devices): give the Phase 7 helper (the Swift
-> encoder in `helper/`) an `--input mjpeg` mode — ImageIO decode of JPEG
-> frames found by SOI/EOI scan, pixel size from the first frame's SOF — and
-> make `backends/device.js`'s `h264Pipeline()` GET the forwarded MJPEG and
-> pipe the body into the helper's stdin (`h264` plan `ok: true` when the
-> helper exists). `swift test` for the new decoder pieces; `npm test` for the
-> plan/pipeline wiring against the fake WDA. Done when `/video` from the
-> primary bench iPhone plays at ≥25 fps in Chrome at a few Mbit/s, and the
-> page still falls back to MJPEG with the helper moved aside. Scope:
-> `docs/ROADMAP.md` § Phase 9. 9.4 is untagged.
-> Separately, the owner still owes a review of the 🏁 Safe public sharing
-> milestone (tick its box when satisfied).
+> Owner: review the 🏁 Safe public sharing milestone (safe link sharing — cookie handoff, expiring shares, Cloudflare quick tunnel) and tick its box when satisfied.
+> The remaining phases need the owner's accounts first: 6b (Cloudflare Access — a domain on a Cloudflare account) and 8b (ngrok — an authtoken in the Keychain as `NGROK_AUTHTOKEN`).
 
 ---
 
 ## Open Decisions (reversible — defaults chosen, proceeding)
 
-- **Device MJPEG default rate, forward proof, no forward respawn (9.2)** → chose **30 fps; prove WDA's MJPEG answers before listening; a dead forward means restart** → DECISIONS.md § Device video mechanics (phase 9)
-- **Device keys, buttons, wake and tap by label (9.3)** → chose **Home = `/wda/homescreen`, Siri refused, wake by home-screen press, a gesture on a locked device spent on the wake, on-screen label matches only (nested ones count once), every error ack toasted** → DECISIONS.md § Device input mechanics (9.3, reversible)
-- **Helper JPEG input (9.4)** → chose **ImageIO decode, frames found by SOI/EOI scan, size from the first SOF; the server fetches the MJPEG and pipes it to the helper's stdin** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
+- _none_
 
 ---
 
@@ -124,7 +112,8 @@
 - **go-ios binds the device's MJPEG forward on all interfaces** (no bind-address option) — anyone on the LAN who finds the port sees the device's screen without a token while a device server runs, as the bench's WDA forwards already allow full control. Keep device runs on trusted networks.
 - **Device mode (Phase 9) is bench-only:** WDA must already be running (`qa-device up <role>`), `ios` (go-ios) is required for the port-forward, and the tool cannot tell a bench device from a personal one — the bench rule is the guard. Keep device shares short.
 - **Device input is slow (9.3):** ~1 s per touch (WDA waits for idle); Home on the home screen answers ~10 s late, holding the queue; Lock times out without locking on the iOS 26.6 bench.
-- **The QuickTime-mirror capture route is unavailable on this Mac** (macOS 27 / iOS 26.6: no AVFoundation muxed device appears even when enabled), so 60 fps over USB is not on the table; WDA's 29 fps MJPEG is the ceiling for devices.
+- **The QuickTime-mirror capture route is unavailable on this Mac** (macOS 27 / iOS 26.6: no AVFoundation muxed device appears even when enabled), so 60 fps over USB is not on the table; WDA's 29 fps MJPEG is the ceiling for devices, H.264 included (~26 fps under motion, 9.4).
+- **Device H.264 after a rotation is stretched**, not re-laid out: the helper scales a landscape image into the portrait picture measured at startup (DECISIONS.md § Device H.264 mechanics).
 - **Phase 8b needs the owner's ngrok account** (authtoken in the Keychain as `NGROK_AUTHTOKEN`). A run reaching it should halt.
 - **Quick tunnels have no uptime guarantee** (one 6.1 run lost every tunnel connection at ~111 s, unexplained). A share meant to last hours may be better on Tailscale Funnel.
 - **Phase 6b needs a domain on a Cloudflare account** (named tunnel + Access policy). A run reaching it should halt.

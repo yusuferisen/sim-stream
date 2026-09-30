@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Stand-in (extensionless, so `node --test` does not run it as a test) for
+// sim-stream-encoder in test/device-backend.test.js: writes its arguments as
+// one line, then echoes stdin to stdout, and exits 0 when stdin ends — as the
+// real helper does at the end of its input.
+process.stdout.write(`ARGS ${process.argv.slice(2).join(" ")}\n`);
+process.stdin.pipe(process.stdout);
+process.stdin.on("end", () => process.exit(0));

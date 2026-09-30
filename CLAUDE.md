@@ -16,12 +16,12 @@ shares.js            Token registry — owner token + expiring --share tokens (p
 h264.js              H.264 path logic — record parser, GOP cache, the /video hub (pure, unit-tested)
 tap-label.js         Tap by accessibility label — axe tap args + AXe error → toast line (pure, unit-tested)
 gallery.js           Screenshot gallery rules — names, listing-matched serving, thumbnail cache, page (unit-tested)
-test/                node:test suites for the import-safe modules (shares, h264, mjpeg, gallery, tap-label, remote, queue, simulator + device backends); fixtures/ holds fake cloudflared + fake ios
+test/                node:test suites for the import-safe modules (shares, h264, mjpeg, gallery, tap-label, remote, queue, simulator + device backends); fixtures/ holds fake cloudflared, fake ios + fake encoder
 remote.js            Remote-access providers (prepare/start/stop), --remote <name>
 public/index.html    The entire client — markup, styles, script in one file
 scripts/start.sh     Dev launcher: checks AXe, installs deps, builds the helper, boots the sim
 scripts/video-probe.js  Scripted /video client — the H.264 path's verification tool
-helper/              Optional SwiftPM encoder: AXe raw BGRA → H.264 (contract: docs/architecture.md)
+helper/              Optional SwiftPM encoder: AXe raw BGRA or a device's MJPEG → H.264 (contract: docs/architecture.md)
 PROGRESS.md          The cursor — injected every session
 docs/                PRD · ROADMAP · OVERVIEW · JOURNAL · DECISIONS · architecture · research/
 ```
@@ -62,7 +62,7 @@ tap by label,
 reload to confirm the 5 s grace window doesn't respawn AXe, and narrow the
 viewport below 720 px for the bottom sheet. If you touch `remote.js`, verify
 at least the `lan` provider from a second device. If you touch the H.264 path
-(`h264.js`, the pipeline in `backends/simulator.js`, `helper/`), run that
+(`h264.js`, either backend's pipeline, `helper/`), run that
 section's `video-probe` step too. If you touch `backends/device.js`, run the
 checklist's device step against the **primary bench device** (never a
 personal phone).

@@ -341,3 +341,18 @@ in front; `/wda/lock` times out and does not lock on iOS 26.6; WDA's element
 click "succeeds" on off-screen elements and `visible == 1` drops on-screen
 ones; ~1 s per touch (WDA waits for idle), one swipe over 10 s mid-animation.
 `npm test` 149/149 (9 new), `swift test` 11/11.
+
+## 2026-09-30 — 9.4 (H.264 for devices — Phase 9, the real-device backend, complete)
+
+The encoder helper gained `--input mjpeg`: `JpegScanner` finds whole JPEGs in
+the byte stream (segment-walking, so an EXIF thumbnail's SOI/EOI is not a
+frame), ImageIO decodes, CoreGraphics draws into the VideoToolbox buffer.
+`backends/device.js` measures WDA's picture from the first JPEG's SOF
+(`parseJpegSize` in `h264.js`), plans H.264 at scale 1, and pipes a second GET
+of the forwarded MJPEG into the helper's stdin. Primary bench iPhone 16e:
+584×1266 H.264 at 26 fps / 1.7 Mbit/s while swiping (30 fps still), against
+30 Mbit/s MJPEG; Chrome decoded 25 fps with the header on `H.264`; an MJPEG
+viewer beside it kept running; helper moved aside → page on `MJPEG`. The
+simulator path re-checked on a clone (~30 fps). Gotcha: a first scanner resync
+skipped one byte and re-found the thumbnail's SOI — resync now skips the
+walked segments. `npm test` 156/156 (7 new), `swift test` 22/22 (11 new).

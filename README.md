@@ -116,8 +116,9 @@ Siri and Apple Pay buttons, Escape and the arrow keys. A device that auto-locked
 is unlocked first (bench devices have no passcode); a tap or swipe aimed at the
 lock screen is spent on that unlock. Tap by label only matches elements on
 screen, and `#id` matches WDA's `name` (the identifier, or the label when an
-element has none). The page shows MJPEG for now (H.264 from a device comes
-later). A WDA that does not answer stops the server at startup with the
+element has none). With the encoder helper built, a device streams H.264 on
+`/video` too (~26 fps at ~2 Mbit/s against MJPEG's ~30 Mbit/s): the server
+feeds WDA's MJPEG into the helper. A WDA that does not answer stops the server at startup with the
 command that fixes it.
 
 ### Share links that expire
@@ -348,7 +349,7 @@ device (`--device`); `server.js` is target-agnostic.
 | `test/remote.test.js`     | Unit tests for the `cloudflared` provider against a fake binary (`npm test`) |
 | `public/index.html`       | Single-page client: H.264 `<canvas>` player / MJPEG `<img>`, pointer/gesture detection, toolbar |
 | `scripts/start.sh`        | Dev launcher: checks AXe (not with `--device`), installs deps, builds the encoder helper, boots simulator, runs server |
-| `helper/`                 | Optional Swift encoder (`npm run build:helper`): AXe raw frames → H.264; contract in `docs/architecture.md` |
+| `helper/`                 | Optional Swift encoder (`npm run build:helper`): AXe raw frames, or a device's MJPEG, → H.264; contract in `docs/architecture.md` |
 
 ## Limitations
 

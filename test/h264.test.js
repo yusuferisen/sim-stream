@@ -21,6 +21,7 @@ import {
   RecordParser,
   codecFromKeyframe,
   defaultBitrate,
+  parseJpegSize,
   parsePngSize,
   planCapture,
 } from "../h264.js";
@@ -602,4 +603,32 @@ test("hub: stop() ends the pipeline and cancels a pending grace stop", () => {
 
 test("hub: refuses to be built without a way to spawn", () => {
   assert.throws(() => new H264Hub({}), /spawnPipeline/);
+});
+
+// --- parseJpegSize ----------------------------------------------------------
+
+// SOI, an APP1 whose EXIF thumbnail has its own SOI and SOF, then the real SOF0.
+function jpegHead(width, height) {
+  const sof = (w, h) => [0xff, 0xc0, 0x00, 0x11, 0x08, h >> 8, h & 0xff, w >> 8, w & 0xff, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01];
+  const thumb = [0xff, 0xd8, ...sof(160, 120), 0xff, 0xd9];
+  const app1 = [0xff, 0xe1, 0x00, 2 + 6 + thumb.length, ...Buffer.from("Exif\0\0", "latin1"), ...thumb];
+  return Buffer.from([0xff, 0xd8, ...app1, ...sof(width, height), 0xff, 0xda, 0x00, 0x02]);
+}
+
+test("parseJpegSize reads the image's SOF past multipart headers and an EXIF thumbnail", () => {
+  const body = Buffer.concat([Buffer.from("--BoundaryString\r\nContent-type: image/jpeg\r\n\r\n"), jpegHead(585, 1266)]);
+  assert.deepEqual(parseJpegSize(body), { width: 585, height: 1266 });
+  assert.deepEqual(parseJpegSize(jpegHead(1170, 2532)), { width: 1170, height: 2532 });
+});
+
+test("parseJpegSize returns null until the SOF has arrived, and for non-JPEGs", () => {
+  const head = jpegHead(585, 1266);
+  const sofEnd = head.length - 4; // the SOS marker and its length follow the SOF
+  for (let n = 0; n < sofEnd - 10; n++) assert.equal(parseJpegSize(head.subarray(0, n)), null, `cut at ${n}`);
+  assert.deepEqual(parseJpegSize(head.subarray(0, sofEnd)), { width: 585, height: 1266 });
+  assert.equal(parseJpegSize(Buffer.from("JPG1JPG2")), null);
+  assert.equal(parseJpegSize("not a buffer"), null);
+  assert.equal(parseJpegSize(jpegHead(0, 10)), null);
+  const noSof = Buffer.from([0xff, 0xd8, 0xff, 0xda, 0x00, 0x02, 0x11]);
+  assert.equal(parseJpegSize(noSof), null);
 });

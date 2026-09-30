@@ -100,3 +100,119 @@ struct FramingTests {
         #expect(Framing.annexB(avcc: []) == [])
     }
 }
+
+@Suite("Options.parse --input mjpeg")
+struct MjpegOptionsTests {
+    @Test func sourceIsOptional() throws {
+        let o = try Options.parse(["--input", "mjpeg"])
+        #expect(o == Options(sourceWidth: 0, sourceHeight: 0, input: .mjpeg))
+        let sized = try Options.parse(["--input", "mjpeg", "--source", "585x1266", "--fps", "30"])
+        #expect(sized == Options(sourceWidth: 585, sourceHeight: 1266, fps: 30, input: .mjpeg))
+    }
+
+    @Test func bgraIsTheDefaultAndStillNeedsSource() throws {
+        #expect(try Options.parse(["--input", "bgra", "--source", "10x10"]).input == .bgra)
+        #expect(throws: OptionsError("--source is required")) { try Options.parse(["--input", "bgra"]) }
+    }
+
+    @Test(arguments: [
+        (["--input", "mjpeg", "--scale", "0.5"], "--scale does not apply to --input mjpeg (the images arrive scaled)"),
+        (["--input", "png"], "--input must be bgra or mjpeg, got png"),
+        (["--input"], "--input requires a value"),
+    ] as [([String], String)])
+    func rejects(args: [String], message: String) {
+        #expect(throws: OptionsError(message)) { try Options.parse(args) }
+    }
+}
+
+/// A marker-valid (not decodable) JPEG: an APP1 carrying a thumbnail with its
+/// own SOI/EOI, an SOF0 of `width`×`height`, an SOS, and entropy data holding
+/// a stuffed FF 00 and a restart marker — every trap an SOI/EOI scan falls into.
+func fakeJpeg(width: Int = 585, height: Int = 1266, fill: UInt8 = 0x11) -> [UInt8] {
+    let thumb: [UInt8] = [0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x03, 0x00, 0xFF, 0xD9]
+    let app1: [UInt8] = [0xFF, 0xE1] + [0x00, UInt8(2 + 6 + thumb.count)] + Array("Exif\0\0".utf8) + thumb
+    let sof: [UInt8] = [0xFF, 0xC0, 0x00, 0x11, 0x08,
+                        UInt8(height >> 8), UInt8(height & 0xFF), UInt8(width >> 8), UInt8(width & 0xFF),
+                        0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]
+    let sos: [UInt8] = [0xFF, 0xDA, 0x00, 0x0C, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00]
+    let entropy: [UInt8] = [fill, 0xFF, 0x00, fill, 0xFF, 0xD3, fill, 0xFF, 0xFF, 0x00, fill]
+    return [0xFF, 0xD8] + app1 + sof + sos + entropy + [0xFF, 0xD9]
+}
+
+/// WDA's multipart framing around each image.
+func part(_ jpeg: [UInt8]) -> [UInt8] {
+    Array("--BoundaryString\r\nContent-type: image/jpeg\r\nContent-Length: \(jpeg.count)\r\n\r\n".utf8)
+        + jpeg + Array("\r\n\r\n".utf8)
+}
+
+@Suite("JpegScanner")
+struct JpegScannerTests {
+    @Test func findsWholeImagesInAMultipartBody() {
+        let a = fakeJpeg(fill: 0x11), b = fakeJpeg(fill: 0x22)
+        var s = JpegScanner()
+        #expect(s.push(part(a) + part(b)) == [a, b])
+        #expect(s.droppedFrames == 0)
+    }
+
+    /// Every split point, so a boundary mid-marker or mid-length is covered.
+    @Test func anyChunkBoundary() {
+        let a = fakeJpeg(fill: 0x11), b = fakeJpeg(fill: 0x22)
+        let body = part(a) + part(b)
+        for cut in 0...body.count {
+            var s = JpegScanner()
+            let got = s.push(Array(body[0..<cut])) + s.push(Array(body[cut...]))
+            #expect(got == [a, b], "cut at \(cut)")
+        }
+    }
+
+    @Test func byteAtATime() {
+        let a = fakeJpeg()
+        var s = JpegScanner()
+        var got: [[UInt8]] = []
+        for byte in part(a) + part(a) { got += s.push([byte]) }
+        #expect(got == [a, a])
+    }
+
+    @Test func aCutShortImageIsDroppedForTheNextOne() {
+        let a = fakeJpeg(fill: 0x11), b = fakeJpeg(fill: 0x22)
+        var s = JpegScanner()
+        // Cut inside the SOF segment: the next SOI arrives where a marker should.
+        let truncated = Array(a[0..<40])
+        #expect(s.push(truncated + part(b)) == [b])
+        #expect(s.droppedFrames == 1)
+    }
+
+    @Test func garbageOnlyYieldsNothing() {
+        var s = JpegScanner()
+        #expect(s.push(Array(repeating: 0xFF, count: 1000)).isEmpty)
+        // …but the trailing FF is kept: it may be the first byte of an SOI.
+        let a = fakeJpeg()
+        #expect(s.push(Array(a[1...])) == [a])
+    }
+
+    @Test func oversizedImageIsDropped() {
+        var s = JpegScanner()
+        // A valid start (SOI … SOS), then entropy data that never ends.
+        let jpeg = fakeJpeg()
+        let sos = Array(jpeg[..<jpeg.firstIndex(of: 0xDA)!]) + [0xDA, 0x00, 0x02]
+        #expect(s.push(sos + Array(repeating: 0x11, count: JpegScanner.maxFrameBytes)).isEmpty)
+        let b = fakeJpeg(fill: 0x22)
+        #expect(s.push(part(b)) == [b])
+        #expect(s.droppedFrames == 1)
+    }
+}
+
+@Suite("JpegInfo.size")
+struct JpegInfoTests {
+    @Test func readsTheSOFPastAnApp1Thumbnail() {
+        #expect(JpegInfo.size(of: fakeJpeg(width: 585, height: 1266))! == (585, 1266))
+        #expect(JpegInfo.size(of: fakeJpeg(width: 1170, height: 2532))! == (1170, 2532))
+    }
+
+    @Test func truncatedOrNotJpegIsNil() {
+        let a = fakeJpeg()
+        #expect(JpegInfo.size(of: Array(a[0..<25])) == nil)
+        #expect(JpegInfo.size(of: [0x89, 0x50, 0x4E, 0x47]) == nil)
+        #expect(JpegInfo.size(of: fakeJpeg(width: 0, height: 10)) == nil)
+    }
+}

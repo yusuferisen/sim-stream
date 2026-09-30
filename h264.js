@@ -4,6 +4,7 @@
 //
 //   planCapture()      what to ask AXe and the helper for, and the picture size
 //   parsePngSize()     the simulator's pixel size, from a screenshot's header
+//   parseJpegSize()    a device's pixel size, from the first JPEG of its MJPEG
 //   RecordParser       the helper's byte stream -> whole records
 //   GopCache           the current group of pictures, so a joiner starts at once
 //   codecFromKeyframe  the WebCodecs codec string, from the SPS
@@ -48,7 +49,7 @@ export function planCapture({ source, scale, fps }) {
   const sw = source?.width, sh = source?.height;
   for (const v of [sw, sh]) {
     if (!Number.isInteger(v) || v < SOURCE_RANGE.min || v > SOURCE_RANGE.max) {
-      return { ok: false, reason: `unusable simulator pixel size ${sw}x${sh}` };
+      return { ok: false, reason: `unusable screen pixel size ${sw}x${sh}` };
     }
   }
   if (!Number.isFinite(fps)) return { ok: false, reason: `--fps is not a number` };
@@ -90,6 +91,37 @@ export function parsePngSize(buf) {
   if (buf.toString("latin1", 12, 16) !== "IHDR") return null;
   const width = buf.readUInt32BE(16), height = buf.readUInt32BE(20);
   return width > 0 && height > 0 ? { width, height } : null;
+}
+
+// { width, height } from the SOF header of the first JPEG in `buf` — which may
+// start with anything (an MJPEG body's part headers) — or null when there is
+// no JPEG, or it is cut short before its SOF. The segments are walked by
+// their lengths, so an EXIF thumbnail inside APP1 is skipped, not measured.
+// Same rules as the helper's JpegInfo.size (helper/Sources/EncoderCore).
+export function parseJpegSize(buf) {
+  if (!Buffer.isBuffer(buf)) return null;
+  let i = -1;
+  for (let k = 0; k + 2 < buf.length; k++) {
+    if (buf[k] === 0xff && buf[k + 1] === 0xd8 && buf[k + 2] === 0xff) { i = k + 2; break; }
+  }
+  if (i < 0) return null;
+  while (i + 3 < buf.length) {
+    if (buf[i] !== 0xff) return null;
+    const marker = buf[i + 1];
+    if (marker === 0xff) { i += 1; continue; }
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+    if (marker === 0xd9 || marker === 0xda) return null; // no SOF before the scan
+    const length = buf.readUInt16BE(i + 2);
+    if (length < 2) return null;
+    // SOF0–SOF15, except DHT (C4), JPG (C8) and DAC (CC), which share the range.
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      if (i + 8 >= buf.length) return null;
+      const height = buf.readUInt16BE(i + 5), width = buf.readUInt16BE(i + 7);
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+    i += 2 + length;
+  }
+  return null;
 }
 
 // --- Helper records ----------------------------------------------------------

@@ -862,3 +862,36 @@ defaults above, because the device answered differently than planned.
 WDA's element click for tap by label (off-screen "success"); the `visible ==
 1` predicate (drops elements that are on screen); retrying a gesture after the
 wake (it would land on whatever the unlock revealed).
+
+---
+
+## 2026-09-30 — Device H.264 mechanics (9.4, reversible)
+
+Calls made while feeding the device's MJPEG into the encoder helper. Each is
+cheap to change. One refines the pre-flight default above.
+
+- **The server measures the picture and passes `--source`.** `/api/info` and
+  the `hello` frame advertise the H.264 size before any viewer spawns the
+  helper, so the server reads the first JPEG's SOF itself at startup
+  (`parseJpegSize`) and tells the helper. The helper can still take the size
+  from the first image when `--source` is absent (the pre-flight default), for
+  a manual `curl | sim-stream-encoder` run.
+- **The scanner walks marker segments, not a bare SOI/EOI search** (refines
+  the pre-flight default). A plain search would end a frame at the EOI of an
+  EXIF thumbnail inside APP1; walking segments by their lengths to SOS, then
+  scanning entropy data (where `FF` is always stuffed), cannot.
+- **An image of another size is scaled to fill** the encoder's fixed picture
+  (a rotation), rather than ending the stream or restarting the encoder. A
+  same-size image is drawn 1:1, losing only an odd last column/row — no
+  resampling blur.
+- **A device whose picture cannot be measured is MJPEG-only, not a startup
+  failure** — the same rule as the simulator's screenshot probe. The
+  measurement shares the forward's ready timeout (10 s).
+- **Each H.264 pipeline is its own GET of WDA's stream.** WDA serves several
+  MJPEG clients at once (measured: an MJPEG viewer and the pipeline together,
+  both ~26 fps), so the MJPEG hub and the H.264 hub stay independent, as on a
+  simulator.
+
+**Rejected:** tee-ing the MJPEG hub's one connection into the helper (couples
+the two hubs' lifecycles for no measured gain); a helper that fetches the URL
+itself (keeps networking out of the helper, per the pre-flight default).

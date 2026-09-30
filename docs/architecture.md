@@ -29,7 +29,7 @@ process.
 | `gallery.js` | The screenshot gallery's rules (§ Screenshot gallery): the folder and file names, which names may be served (matched against the directory listing), the `sips` thumbnail cache, and the `/gallery` page. Import-safe; `sips` is handed in. |
 | `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`, plus the `cloudflared` provider's pieces for tests (`cloudflaredProvider` factory, output parsers, `waitForAuthoritativeDns`). Knows nothing about streaming or input. Import-safe: nothing runs until a provider's hook is called. |
 | `public/index.html` | The entire client — markup, styles, and script in one file: the H.264 player (WebCodecs → `<canvas>`), the MJPEG `<img>` it falls back to, the input layer. Served with one templated substitution. |
-| `helper/` | **Optional** SwiftPM package: `sim-stream-encoder`, raw BGRA frames on stdin → VideoToolbox H.264 on stdout. Built by `npm run build:helper` (or by `start.sh`); nothing requires it (§ H.264 encoder helper). Its pure logic (`EncoderCore`: arguments, AXe's frame layout, output framing) has a `swift test` target. |
+| `helper/` | **Optional** SwiftPM package: `sim-stream-encoder`, raw BGRA frames (or, `--input mjpeg`, a device's MJPEG body) on stdin → VideoToolbox H.264 on stdout. Built by `npm run build:helper` (or by `start.sh`); nothing requires it (§ H.264 encoder helper). Its pure logic (`EncoderCore`: arguments, AXe's frame layout, the JPEG scanner and SOF reader, output framing) has a `swift test` target. |
 | `scripts/start.sh` | Dev launcher: verifies AXe is present (skipped with `--device`), installs node deps if absent, builds the encoder helper when `swift` is on PATH and the binary is missing or older than its sources (a failed build is reported and skipped, never fatal), handles `--list`, translates `--no-auth` → `--auth false`, `exec`s the server. |
 | `scripts/video-probe.js` | Verification tool: a scripted `/video` client that reports what arrived (record and keyframe counts, frame rate, close code) and can save the stream for `ffprobe`. Not used by the server. |
 
@@ -212,7 +212,8 @@ Places designed to be extended, and the contract each one implies.
   backend. Two implementations, selected by flag in `server.js`:
   `createSimulatorBackend({udid, mjpeg:{fps,quality,scale},
   h264:{encoder,fps,scale}, log})` (the default) and
-  `createDeviceBackend({device, wda, mjpeg:{fps,quality,scale}, log})`
+  `createDeviceBackend({device, wda, mjpeg:{fps,quality,scale},
+  h264:{encoder,fps}, log})`
   (`--device`). Both are `async` — they boot or connect and measure the screen
   — and a creation failure exits the server with the message, before it
   listens.
@@ -265,9 +266,27 @@ Places designed to be extended, and the contract each one implies.
   runtime: "iOS <ver>", deviceType: <ProductType>}`; `openMjpeg()` is an HTTP
   GET through the forward — WDA speaks real HTTP, so the body arrives bare —
   and throws if the forward has exited (nothing respawns it: restart the
-  server); `h264` is `{ok: false}` and `h264Pipeline()` throws;
+  server); `h264` and `h264Pipeline()` are *H.264* below;
   `screenshot()` writes WDA's `/screenshot` (base64 PNG, sessionless) after
   checking the PNG signature.
+
+  *H.264.* Decided at creation, after the forward is up (and after its exit
+  hook, so a server stopped mid-measurement leaves no forward): the helper
+  must be executable, then a GET through the forward is read until
+  `parseJpegSize()` (`h264.js`) finds the first JPEG's SOF — the pixel size
+  WDA sends at the current `mjpegScalingFactor`, which no table can know
+  (585×1266 on the 16e at scale 0.5). `h264` is then `planCapture({source,
+  scale: 1, fps})` (WDA's images arrive scaled) — 584×1266. No helper, or no
+  JPEG header within the ready timeout, is `{ok: false, reason}` and MJPEG
+  only, never a startup failure. `h264Pipeline()` is a second GET of the
+  forwarded stream piped (Node `pipe`, so backpressure reaches WDA's socket)
+  into `sim-stream-encoder --input mjpeg --source <W>x<H> --fps <N>`. The
+  JPEG stream is a few MB/s, so it passes through Node (DECISIONS.md § Phase 9
+  pre-flight defaults) — unlike the simulator's raw frames. The stream's end
+  ends the helper's stdin and the helper exits 0; the helper's exit is the
+  pipeline's one `exit`; `kill()` aborts the GET and SIGTERMs the helper
+  (SIGKILL after 2 s). Throws when the plan is off or the forward has
+  exited. WDA serves an MJPEG viewer and the H.264 pipeline at once.
 
   *Input.* `input()` runs every command through its own `SerialQueue`, like
   the simulator's. `wdaInputRequest(evt, bounds)` (pure) maps an event to one
@@ -383,7 +402,7 @@ Places designed to be extended, and the contract each one implies.
 ## H.264 encoder helper (`helper/`) — the contract the server builds on
 
 `sim-stream-encoder` is a standalone process with a written contract: the
-server (the simulator backend's `h264Pipeline()`, the parser in `h264.js`) is
+server (both backends' `h264Pipeline()`, the parser in `h264.js`) is
 built on this section, not on the Swift. § H.264 video path is what the server does
 with it.
 
@@ -396,12 +415,15 @@ helper`) → `helper/.build/release/sim-stream-encoder`. Tests: `swift test` in
 ```
 axe stream-video --udid <UDID> --format bgra --fps <N> --scale <S> \
   | sim-stream-encoder --source <W>x<H> [--scale <S>] [--fps <N>] [--bitrate <bps>] [--output framed|annexb]
+curl -sN http://127.0.0.1:<forwarded WDA MJPEG port>/ \
+  | sim-stream-encoder --input mjpeg [--source <W>x<H>] [--fps <N>] [--bitrate <bps>] [--output framed|annexb]
 ```
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--source WxH` | The simulator screen in **pixels** — read it from a screenshot's PNG header. Never from `boundsForDeviceType` (points), never hardcoded. | required |
-| `--scale S` | The **same value** passed to `axe stream-video --scale`, 0.1–1.0. | `1.0` |
+| `--input` | `bgra`: AXe's raw frames (below). `mjpeg`: an MJPEG body (below). | `bgra` |
+| `--source WxH` | `bgra`: the simulator screen in **pixels** — read it from a screenshot's PNG header. Never from `boundsForDeviceType` (points), never hardcoded. `mjpeg`: the picture to encode at (made even); absent → the first image's size. | required for `bgra` |
+| `--scale S` | `bgra` only: the **same value** passed to `axe stream-video --scale`, 0.1–1.0. Refused with `--input mjpeg` (exit 2): the images arrive scaled. | `1.0` |
 | `--fps N` | The same value passed to AXe's `--fps`, 1–30. Sets the keyframe interval (one per second) and rate-control hints. | `30` |
 | `--bitrate bps` | Average bit rate, ≥ 50000. | ≈ 0.08 bit/pixel/frame (≈1.9 Mbit/s at scale 0.5, ≈7.6 at 1.0) |
 | `--output` | `framed` (below) for the server; `annexb` is a bare elementary stream for `ffprobe`/`ffplay`. | `framed` |
@@ -414,6 +436,19 @@ only, the row count is padded to a multiple of 16. 1206×2622 at 0.5 → 603×13
 picture, 2432 B/row × 1311 rows = 3 188 352 B/frame; at 1.0 → 4864 B/row ×
 2624 rows. A wrong `--source` or `--scale` does not error — it garbles the
 picture (every row shifts), so pass exactly what AXe was given.
+
+**Input `--input mjpeg`: JPEGs anywhere in the byte stream.** The helper
+never parses multipart headers: `JpegScanner` finds an SOI (`FF D8 FF`),
+walks the marker segments by their lengths to the start of scan — so an EXIF
+thumbnail's own SOI/EOI inside APP1 is skipped — and scans the entropy data
+for EOI (`FF D9`; stuffed `FF 00` and restart markers are skipped, any other
+marker is walked as a segment). Bytes between images are discarded; an image
+cut short (a new SOI where a marker belongs, a bad length, over 32 MB) is
+dropped and scanning resumes. Each image is decoded with ImageIO and drawn
+into the encoder's buffer: 1:1 when its size (made even) matches, losing only
+an odd last column/row; scaled to fill otherwise (a rotation). An image
+ImageIO cannot decode is skipped, with a stderr line on the first and every
+100th.
 
 **Encoded picture: even dimensions.** H.264 4:2:0 cannot code odd sizes, so an
 odd last column/row is dropped: 603×1311 → **602×1310** (1206×2622 is already
@@ -441,21 +476,26 @@ no `description`); the codec string comes from the SPS (`avc1.` + profile,
 constraint, level bytes).
 
 **stderr and exit.** One geometry line at start (`602x1310 @30fps … B/frame`),
-then diagnostics only — never parse it. Exit **0** on end of input (a trailing
-partial frame is dropped, with a line on stderr) or when stdout's reader goes
+then diagnostics only — never parse it (with `--input mjpeg` and no
+`--source`, the line comes with the first image). Exit **0** on end of input (a trailing
+partial frame or image is dropped) or when stdout's reader goes
 away (`EPIPE`, no `SIGPIPE` death); **2** on bad arguments; **1** when
 VideoToolbox cannot start or fails mid-stream. Closing its stdin — or killing
 AXe — is how to stop it.
 
 **Measured** (AXe 1.8.0, iOS 27 headless clone, scrolling Settings, framed
 output): 30.3 fps at scale 0.5 (541 frames, keyframes ≤ 1.05 s apart), 30.7 fps
-at 1.0; `ffprobe` decodes every frame of the unframed payload.
+at 1.0; `ffprobe` decodes every frame of the unframed payload. `--input mjpeg` from the primary bench iPhone 16e (WDA
+at 30 fps, scale 0.5, quality 75; 585×1266 → 584×1266): 26 fps and 1.7 Mbit/s
+while swiping home-screen pages (30 fps when still), against 30 Mbit/s for the
+same MJPEG; Chrome decoded 25 fps.
 
 ## H.264 video path (`h264.js`, `/video`)
 
 **Availability is decided once, at startup.** The path exists for a run only
-if the helper binary is present and the simulator's pixel size could be read
-from a screenshot (the backend's `h264` plan). Otherwise there is no hub, `/video` answers
+if the helper binary is present and the picture's pixel size could be
+measured — from a screenshot on a simulator, from the first JPEG on a device
+(the backend's `h264` plan). Otherwise there is no hub, `/video` answers
 `404` to an authorized upgrade, and MJPEG is the whole video path — one log
 line and the `video:` banner line say which. `/api/info` and the `hello` frame
 carry the outcome:
@@ -631,7 +671,8 @@ the expiry boundary, the two-clock and latch rules, session tracking, and the
 expiry timer. Anything that changes how a token is accepted or when it dies
 belongs there first; expiry bugs are silent, and these tests are the only
 thing that would surface one. `h264.js` — the capture plan (pinned to the
-measured picture sizes), record parsing at every possible chunk boundary, the
+measured picture sizes), the JPEG SOF reader (past multipart headers and an
+EXIF thumbnail, and at every cut before the SOF), record parsing at every possible chunk boundary, the
 group-of-pictures cache, and the hub on a fake pipeline, fake viewers and a
 hand-cranked clock: refcount and grace window, the generation guard, what a
 joining or lagging viewer is sent, and what happens when the pipeline dies.
@@ -662,8 +703,14 @@ WDA, the wake (a gesture spent on it, text typed after it, a device that stays
 locked), tap by label (off-screen and nested matches, ambiguity, the NSPredicate
 escaping), `stop()` killing the forward, a missing WDA
 failing before any forward, go-ios's bind failure, a non-MJPEG listener
-refused at once with the child killed, the `ios info` fallback, and a
-missing `ios`.
+refused at once with the child killed, the `ios info` fallback, a
+missing `ios`, and H.264 against `test/fixtures/fake-encoder` (which echoes
+its argv and stdin): the plan from the first JPEG (not its thumbnail), off
+without a helper or a measurable stream, the forwarded body reaching the
+helper's stdin, one `exit` on `kill()` and on the stream's end, and a refusal
+once the forward is gone. The helper's `swift test` covers `--input` parsing,
+`JpegScanner` (a multipart body, every chunk split, byte-at-a-time, a
+cut-short and an oversized image, leading garbage) and `JpegInfo.size`.
 
 Everything else has **no automated coverage**, and the reason is structural:
 every other meaningful path requires a booted iOS Simulator plus the AXe binary
@@ -728,6 +775,10 @@ phase gate is a browser session:
     ends at its deadline and its link is then `401`; after Ctrl-C
     `pgrep -f 'ios forward --udid='` finds nothing; and `--wda
     http://localhost:<unused>` exits at startup with `qa-device up primary`.
+    With the helper built the startup log says `/video serves H.264 <W>x<H>`
+    and Chrome's header reads `H.264`; `video-probe` while swiping reports
+    ≥25 fps at a few Mbit/s; a `/stream` viewer beside it still runs; with
+    the helper moved aside the page reads `MJPEG`.
 
 What remains uncovered in `server.js` — `parseArgs`, the cookie handoff, the
 upgrade handler — runs side effects at import. Covering it means moving it

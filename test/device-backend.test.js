@@ -31,7 +31,9 @@ import {
   wdaSettings,
 } from "../backends/device.js";
 
-const FAKE_IOS = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-ios");
+const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
+const FAKE_IOS = path.join(FIXTURES, "fake-ios");
+const FAKE_ENCODER = path.join(FIXTURES, "fake-encoder");
 const UDID = "00008140-001A69993C79401C";
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
 
@@ -109,15 +111,38 @@ function fakeWda({ sessionGone = 0, size = { width: 390, height: 844 }, locked =
   return { server, state };
 }
 
+// A marker-valid JPEG header (not decodable): an APP1 holding a thumbnail with
+// its own SOI/EOI and SOF, then the image's SOF0 of width×height, SOS, data.
+function fakeJpeg(width, height) {
+  const sof = (w, h) => [0xff, 0xc0, 0x00, 0x11, 0x08, h >> 8, h & 0xff, w >> 8, w & 0xff, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01];
+  const thumb = [0xff, 0xd8, ...sof(160, 120), 0xff, 0xd9];
+  const app1 = [0xff, 0xe1, 0x00, 2 + 6 + thumb.length, ...Buffer.from("Exif\0\0", "latin1"), ...thumb];
+  const sos = [0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3f, 0x00];
+  return Buffer.from([0xff, 0xd8, ...app1, ...sof(width, height), ...sos, 0x11, 0xff, 0x00, 0x11, 0xff, 0xd9]);
+}
+
 // WDA's MJPEG server: its real headers, then two frames and a held connection.
-function fakeMjpeg({ contentType = "multipart/x-mixed-replace; boundary=--BoundaryString" } = {}) {
+// `jpeg` makes the frames fakeJpeg(width, height) instead of "JPG<n>";
+// `end` closes the stream after the frames.
+function fakeMjpeg({ contentType = "multipart/x-mixed-replace; boundary=--BoundaryString", jpeg = null, end = false } = {}) {
   const state = { connections: 0 };
   const server = http.createServer((req, res) => {
     state.connections++;
     res.writeHead(200, { Server: "WDA MJPEG Server", "Content-Type": contentType, Connection: "close" });
-    const frame = (n) => `--BoundaryString\r\nContent-type: image/jpeg\r\nContent-Length: 4\r\n\r\nJPG${n}\r\n\r\n`;
+    const frame = (n) => {
+      const body = jpeg ? fakeJpeg(jpeg.width, jpeg.height) : Buffer.from(`JPG${n}`);
+      return Buffer.concat([
+        Buffer.from(`--BoundaryString\r\nContent-type: image/jpeg\r\nContent-Length: ${body.length}\r\n\r\n`),
+        body,
+        Buffer.from("\r\n\r\n"),
+      ]);
+    };
     res.write(frame(1));
-    setTimeout(() => res.write(frame(2)), 20);
+    setTimeout(() => {
+      if (res.destroyed) return;
+      res.write(frame(2));
+      if (end) res.end();
+    }, 20);
   });
   return { server, state };
 }
@@ -326,7 +351,7 @@ test("createDeviceBackend: identity, bounds, settings, boundary; streams through
   assert.deepEqual(backend.bounds, { w: 390, h: 844 });
   assert.equal(backend.mjpegBoundary, "--BoundaryString");
   assert.equal(backend.h264.ok, false);
-  assert.match(backend.h264.reason, /9\.4/);
+  assert.match(backend.h264.reason, /no encoder helper configured/);
   assert.deepEqual(wda.state.settings, [{ mjpegServerFramerate: 30, mjpegScalingFactor: 50, mjpegServerScreenshotQuality: 75 }]);
   assert.ok(logs.some((l) => l.startsWith("[device] selected: MGL-QA-16E")), logs.join("\n"));
 
@@ -471,4 +496,76 @@ test("input: tap by label taps the on-screen match's centre; misses and ambiguit
   await assert.rejects(backend.input({ type: "tap-label", text: "Nothing" }), /No on-screen element matched label 'Nothing'/);
   await assert.rejects(backend.input({ type: "tap-label", text: "#" }), /nothing after #/);
   assert.equal(wda.state.input.length, taps, "no tap after a refused lookup");
+});
+
+// --- H.264 (9.4) -------------------------------------------------------------
+
+test("createDeviceBackend: H.264 is planned from the first JPEG's size, even, at scale 1", async (t) => {
+  const { make } = await rig(t, { mjpegOpts: { jpeg: { width: 585, height: 1266 } } });
+  const backend = await make({ h264: { encoder: FAKE_ENCODER, fps: 30 } });
+  t.after(() => backend.stop());
+  const p = backend.h264;
+  assert.equal(p.ok, true, p.reason);
+  // The APP1 thumbnail's 160×120 SOF comes first in the bytes, and is not it.
+  assert.deepEqual(p.source, { width: 585, height: 1266 });
+  assert.deepEqual([p.width, p.height, p.fps, p.scale], [584, 1266, 30, 1]);
+});
+
+test("createDeviceBackend: H.264 is off, never fatal, without a helper or a measurable stream", async (t) => {
+  const { make } = await rig(t);
+  const missing = await make({ h264: { encoder: path.join(FIXTURES, "no-such-encoder"), fps: 30 } });
+  t.after(() => missing.stop());
+  assert.equal(missing.h264.ok, false);
+  assert.match(missing.h264.reason, /encoder helper not built \(npm run build:helper\)/);
+
+  // "JPG1"/"JPG2" frames and a held connection: no JPEG header ever arrives.
+  const blind = await make({ h264: { encoder: FAKE_ENCODER, fps: 30 }, readyTimeoutMs: 300 });
+  t.after(() => blind.stop());
+  assert.equal(blind.h264.ok, false);
+  assert.match(blind.h264.reason, /could not measure the device's MJPEG picture \(no JPEG header within/);
+  assert.throws(() => blind.h264Pipeline(), /H\.264 is off: could not measure/);
+});
+
+test("device h264Pipeline: the forwarded MJPEG body goes into the helper's stdin; kill() ends it once", async (t) => {
+  const { make } = await rig(t, { mjpegOpts: { jpeg: { width: 585, height: 1266 } } });
+  const backend = await make({ h264: { encoder: FAKE_ENCODER, fps: 30 } });
+  t.after(() => backend.stop());
+  const pipeline = backend.h264Pipeline();
+  const chunks = [];
+  pipeline.on("data", (c) => chunks.push(c));
+  const exits = [];
+  pipeline.on("exit", (d) => exits.push(d));
+  const jpeg = fakeJpeg(585, 1266);
+  assert.ok(await waitFor(() => {
+    const all = Buffer.concat(chunks);
+    return all.indexOf(jpeg) !== all.lastIndexOf(jpeg); // both frames arrived
+  }), Buffer.concat(chunks).toString("latin1").slice(0, 200));
+  assert.ok(Buffer.concat(chunks).toString("latin1").startsWith("ARGS --input mjpeg --source 585x1266 --fps 30\n"));
+  pipeline.kill();
+  pipeline.kill();
+  assert.ok(await waitFor(() => exits.length === 1));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(exits.length, 1);
+  assert.match(exits[0], /encoder killed by SIGTERM/);
+});
+
+test("device h264Pipeline: the end of the device's stream ends the helper, and the pipeline", async (t) => {
+  const { make } = await rig(t, { mjpegOpts: { jpeg: { width: 390, height: 844 }, end: true } });
+  const backend = await make({ h264: { encoder: FAKE_ENCODER, fps: 15 } });
+  t.after(() => backend.stop());
+  assert.equal(backend.h264.fps, 15);
+  const pipeline = backend.h264Pipeline();
+  pipeline.on("data", () => {});
+  const exits = [];
+  pipeline.on("exit", (d) => exits.push(d));
+  assert.ok(await waitFor(() => exits.length === 1));
+  assert.match(exits[0], /stream ended, encoder exited 0/);
+});
+
+test("device h264Pipeline: refuses once the forward is gone", async (t) => {
+  const { make } = await rig(t, { mjpegOpts: { jpeg: { width: 390, height: 844 } } });
+  const backend = await make({ h264: { encoder: FAKE_ENCODER, fps: 30 } });
+  backend.stop();
+  assert.ok(await waitFor(() => { try { backend.openMjpeg(); return false; } catch { return true; } }));
+  assert.throws(() => backend.h264Pipeline(), /port-forward to the device has exited/);
 });

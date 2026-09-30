@@ -22,7 +22,11 @@
 // long-presses and swipes as W3C touch actions in points, text and the
 // special keys WDA can type through /wda/keys, home and lock through WDA, tap
 // by label as an element lookup plus a tap. A locked device is woken first.
-// H.264 is off (Phase 9.4).
+//
+// H.264 (when the helper is built) is the Phase 7 helper in `--input mjpeg`
+// mode fed a second GET of the same forwarded stream: the server pipes the
+// HTTP body into the helper's stdin. The picture size is measured once at
+// startup, from the first JPEG's SOF header.
 //
 // Import-safe: nothing runs until createDeviceBackend() is called. Covered by
 // test/device-backend.test.js against a fake WDA server and
@@ -34,8 +38,10 @@ import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 
+import { parseJpegSize, planCapture } from "../h264.js";
 import { parseTapTarget } from "../tap-label.js";
 import { SerialQueue } from "./queue.js";
+import { relayStderr } from "./simulator.js";
 
 // qa-device's bench roles. Anything else given to --device is a UDID.
 export const BENCH_ROLES = Object.freeze(["primary", "secondary", "tablet"]);
@@ -470,6 +476,131 @@ function openForwardedMjpeg(port, log) {
   return source;
 }
 
+// --- H.264 -------------------------------------------------------------------
+
+// Reads the forwarded MJPEG until the first JPEG's SOF header arrives and
+// resolves its pixel size — what WDA sends at the current mjpegScalingFactor,
+// which no table can know.
+function measureMjpeg(port, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let got = Buffer.alloc(0);
+    const req = http.get({ host: "127.0.0.1", port, path: "/", timeout: timeoutMs }, (res) => {
+      if (res.statusCode !== 200) {
+        req.destroy();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      res.on("data", (chunk) => {
+        got = Buffer.concat([got, chunk]);
+        const size = parseJpegSize(got);
+        if (size) {
+          req.destroy();
+          resolve(size);
+        } else if (got.length > 4 * 1024 * 1024) {
+          req.destroy(new Error("no JPEG header in the first 4 MB"));
+        }
+      });
+      res.on("end", () => reject(new Error("the stream ended before a JPEG header")));
+    });
+    req.on("timeout", () => req.destroy(new Error(`no JPEG header within ${Math.round(timeoutMs / 1000)} s`)));
+    req.on("error", reject);
+  });
+}
+
+// Decides once, at startup, whether /video exists for this run: the helper
+// must be built and the stream's pixel size measurable. Returns
+// planCapture()'s result (scale 1: WDA's images arrive scaled) or
+// { ok: false, reason }. Never throws — every failure means "MJPEG only".
+async function planDeviceH264(port, h264, timeoutMs) {
+  if (!h264?.encoder) return { ok: false, reason: "no encoder helper configured" };
+  try {
+    fs.accessSync(h264.encoder, fs.constants.X_OK);
+  } catch {
+    return { ok: false, reason: "encoder helper not built (npm run build:helper)" };
+  }
+  let source;
+  try {
+    source = await measureMjpeg(port, timeoutMs);
+  } catch (e) {
+    return { ok: false, reason: `could not measure the device's MJPEG picture (${e.message})` };
+  }
+  return planCapture({ source, scale: 1, fps: h264.fps });
+}
+
+// The device's H.264 pipeline: a GET of the forwarded MJPEG, its body piped
+// into `sim-stream-encoder --input mjpeg`, in the shape H264Hub expects — an
+// emitter with "data" (the helper's records), "exit" (once, when the helper
+// is gone) and kill(). The stream is a few MB/s of JPEG, so it passes through
+// this process (DECISIONS.md § Phase 9 pre-flight defaults); the end of the
+// stream closes the helper's stdin and the helper exits on its own.
+function spawnDeviceH264(encoder, port, plan, log) {
+  const encArgs = [
+    "--input", "mjpeg",
+    "--source", `${plan.source.width}x${plan.source.height}`,
+    "--fps", String(plan.fps),
+  ];
+  log(`spawn: GET 127.0.0.1:${port}/ | sim-stream-encoder ${encArgs.join(" ")}`);
+  const enc = spawn(encoder, encArgs, { stdio: ["pipe", "pipe", "pipe"] });
+  // A spawn that fails for lack of file descriptors comes back without its
+  // stdio streams (and reports through "error").
+  if (!enc.stdin || !enc.stdout || !enc.stderr) {
+    enc.on("error", () => {});
+    enc.kill("SIGKILL");
+    throw new Error("could not spawn the encoder");
+  }
+
+  const pipeline = new EventEmitter();
+  const running = () => enc.exitCode === null && enc.signalCode === null;
+  let killed = false;
+  let killTimer = null;
+  let exited = false;
+  const how = [];
+
+  const req = http.get({ host: "127.0.0.1", port, path: "/" }, (res) => {
+    if (res.statusCode !== 200) {
+      res.resume();
+      how.push(`stream HTTP ${res.statusCode}`);
+      return pipeline.kill();
+    }
+    res.pipe(enc.stdin);
+    res.on("end", () => how.push("stream ended"));
+    res.on("error", (e) => { if (!killed) how.push(`stream failed (${e.message})`); });
+    // An abrupt close does not end the pipe: end the helper's input here.
+    res.on("close", () => enc.stdin.end());
+  });
+  req.on("error", (e) => {
+    if (!killed) how.push(`stream failed (${e.message})`);
+    enc.stdin.end();
+  });
+  // A helper that died leaves writes to its stdin failing with EPIPE; its
+  // "exit" is what ends the pipeline.
+  enc.stdin.on("error", () => {});
+
+  pipeline.kill = () => {
+    if (killed) return;
+    killed = true;
+    req.destroy();
+    if (running()) enc.kill("SIGTERM");
+    killTimer = setTimeout(() => { if (running()) enc.kill("SIGKILL"); }, 2000);
+    killTimer.unref();
+  };
+
+  const end = (detail) => {
+    if (exited) return;
+    exited = true;
+    clearTimeout(killTimer);
+    // The helper is gone: nothing reads the stream any more.
+    killed = true;
+    req.destroy();
+    pipeline.emit("exit", [...how, `encoder ${detail}`].join(", "));
+  };
+  enc.on("exit", (code, sig) => end(sig ? `killed by ${sig}` : `exited ${code}`));
+  enc.on("error", (e) => end(`failed (${e.message})`));
+  enc.stdout.on("data", (chunk) => pipeline.emit("data", chunk));
+  enc.stdout.on("error", () => {});
+  relayStderr(enc.stderr, "[encoder]");
+  return pipeline;
+}
+
 // --- The backend -------------------------------------------------------------
 
 // Resolves the device, checks WDA, reads the device's identity, opens a WDA
@@ -480,12 +611,15 @@ function openForwardedMjpeg(port, log) {
 //   device    `--device`: a UDID, or primary|secondary|tablet (via qa-device)
 //   wda       `--wda`: WDA's base URL; null = the role's port, else :8100
 //   mjpeg     { fps, quality, scale } → WDA's MJPEG settings
+//   h264      { encoder, fps } — the helper binary's path and the H.264 rate;
+//             null (or no helper built) = MJPEG only
 //   log(line) startup and lifecycle lines, already prefixed
 //   ios, run, readyTimeoutMs, wdaTimeoutMs — injectable for tests
 export async function createDeviceBackend({
   device,
   wda = null,
   mjpeg,
+  h264 = null,
   log = () => {},
   ios = null,
   run = runSync,
@@ -532,6 +666,7 @@ export async function createDeviceBackend({
   });
   log(`[device] forward ready: 127.0.0.1:${port} → device:${DEVICE_MJPEG_PORT}`);
 
+
   // A server that exits without stop() — a failed tunnel start, the shutdown
   // timer — must not leave the forward running. Synchronous, so it runs even
   // from process.exit().
@@ -542,6 +677,9 @@ export async function createDeviceBackend({
   forward.on("exit", (code, sig) => {
     if (!stopping) log(`[device] ios forward exited (${sig || `code ${code}`}) — the stream cannot reconnect; restart the server`);
   });
+
+  // After the exit hook, so a server stopped mid-measurement leaves no forward.
+  const plan = await planDeviceH264(port, h264, readyTimeoutMs);
 
   const queue = new SerialQueue();
 
@@ -576,7 +714,7 @@ export async function createDeviceBackend({
     kind: "device",
     target,
     bounds,
-    h264: { ok: false, reason: "H.264 from a device is not built yet (Phase 9.4)" },
+    h264: plan,
     mjpegBoundary: boundary,
 
     openMjpeg() {
@@ -585,7 +723,9 @@ export async function createDeviceBackend({
     },
 
     h264Pipeline() {
-      throw new Error("H.264 is off: from a device it is not built yet (Phase 9.4)");
+      if (!plan.ok) throw new Error(`H.264 is off: ${plan.reason}`);
+      if (!running()) throw new Error("the port-forward to the device has exited; restart the server");
+      return spawnDeviceH264(h264.encoder, port, plan, (line) => log(`[h264] ${line}`));
     },
 
     // Every command runs through one FIFO, after a wake check. A coordinate

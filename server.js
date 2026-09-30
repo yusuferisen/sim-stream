@@ -263,6 +263,7 @@ async function main() {
           device: args.device,
           wda: args.wda || null,
           mjpeg: { fps: FPS, quality: QUALITY, scale: SCALE },
+          h264: { encoder: ENCODER, fps: H264_FPS },
           log,
         })
       : await createSimulatorBackend({
