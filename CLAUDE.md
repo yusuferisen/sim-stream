@@ -12,14 +12,16 @@ test/                node:test suite (shares.js only)
 remote.js            Remote-access providers (prepare/start/stop), --remote <name>
 public/index.html    The entire client — markup, styles, script in one file
 scripts/start.sh     Dev launcher: checks AXe, installs deps, boots the sim
+helper/              Optional SwiftPM encoder: AXe raw BGRA → H.264 (contract: docs/architecture.md)
 PROGRESS.md          The cursor — injected every session
 docs/                PRD · ROADMAP · OVERVIEW · JOURNAL · DECISIONS · architecture · research/
 ```
 
 ## Build / run / test contract
 
-There is no build step. `npm test` covers only `shares.js` (the token
-registry); everything else is verified by hand — see below.
+There is no required build step. `npm test` covers only `shares.js` (the token
+registry); the optional encoder helper has its own `swift test`; everything
+else is verified by hand — see below.
 
 ```sh
 npm install                                  # deps: express, ws
@@ -30,6 +32,8 @@ npm install                                  # deps: express, ws
 ./scripts/start.sh --share demo=2h           # also mint an expiring link
 node server.js --port 9090                   # server directly; same flags
 node --check server.js && node --check remote.js && node --check shares.js   # syntax gate
+npm run build:helper                         # optional: build helper/ (needs swift)
+(cd helper && swift test)                    # helper's argument/layout/framing tests
 npm test                                     # node --test — shares.js unit tests, no simulator
 ```
 

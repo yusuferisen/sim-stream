@@ -19,6 +19,7 @@ process.
 | `shares.js` | The credential registry (`ShareRegistry`): the owner token plus expiring share tokens, constant-time matching, the definition of expiry, and the tracking that ends long-lived connections when a share dies. Pure — no I/O, no side effects at import, clocks injectable — so it is unit-testable without a simulator. Also exports `parseTtl` / `parseShareSpec`. |
 | `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`. Knows nothing about streaming or input. |
 | `public/index.html` | The entire client — markup, styles, and script in one file. Served with one templated substitution. |
+| `helper/` | **Optional** SwiftPM package: `sim-stream-encoder`, raw BGRA frames on stdin → VideoToolbox H.264 on stdout. Built by `npm run build:helper`; nothing requires it (§ H.264 encoder helper). Its pure logic (`EncoderCore`: arguments, AXe's frame layout, output framing) has a `swift test` target. |
 | `scripts/start.sh` | Dev launcher: verifies AXe is present, installs node deps if absent, handles `--list`, translates `--no-auth` → `--auth false`, `exec`s the server. |
 
 ## Dependencies
@@ -28,7 +29,8 @@ process.
   built-in `node:test` runner; there are no dev dependencies.
 - **External binaries:** `axe` (capture + HID injection) and `xcrun simctl`
   (device enumeration, boot, screenshots). Both must exist on the host; neither
-  is installable in CI, which is why there is no CI.
+  is installable in CI, which is why there is no CI. `swift` (the Xcode
+  toolchain) is needed only to build the optional encoder helper.
 - **No network service on the default path.** Running the tool requires no
   account, no hosted backend, no auth provider, and no storage — it works
   offline and air-gapped. The shipped Tailscale providers (and Cloudflare
@@ -178,6 +180,76 @@ Places designed to be extended, and the contract each one implies.
   entry** — a miss here is the single most likely cause of "taps land in the
   wrong place," and it degrades silently.
 
+## H.264 encoder helper (`helper/`) — the contract the server builds on
+
+`sim-stream-encoder` is a standalone process: nothing in `server.js` or
+`start.sh` knows about it yet. Whoever spawns it works from this section, not
+from the Swift.
+
+**Build.** `npm run build:helper` (= `swift build -c release --package-path
+helper`) → `helper/.build/release/sim-stream-encoder`. Tests: `swift test` in
+`helper/`. The binary is optional: without it, MJPEG is the whole video path.
+
+**Command line.**
+
+```
+axe stream-video --udid <UDID> --format bgra --fps <N> --scale <S> \
+  | sim-stream-encoder --source <W>x<H> [--scale <S>] [--fps <N>] [--bitrate <bps>] [--output framed|annexb]
+```
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--source WxH` | The simulator screen in **pixels** — read it from a screenshot's PNG header. Never from `boundsForDeviceType` (points), never hardcoded. | required |
+| `--scale S` | The **same value** passed to `axe stream-video --scale`, 0.1–1.0. | `1.0` |
+| `--fps N` | The same value passed to AXe's `--fps`, 1–30. Sets the keyframe interval (one per second) and rate-control hints. | `30` |
+| `--bitrate bps` | Average bit rate, ≥ 50000. | ≈ 0.08 bit/pixel/frame (≈1.9 Mbit/s at scale 0.5, ≈7.6 at 1.0) |
+| `--output` | `framed` (below) for the server; `annexb` is a bare elementary stream for `ffprobe`/`ffplay`. | `framed` |
+
+**Input: AXe's raw frames are padded, not `w×h×4`.** Frames arrive back to
+back with no header. From `--source` and `--scale` the helper derives the
+layout (`FrameLayout.axe`, measured on AXe 1.8.0): picture = `floor(pixels ×
+scale)` per axis; each row padded to a multiple of **64 bytes**; at scale 1.0
+only, the row count is padded to a multiple of 16. 1206×2622 at 0.5 → 603×1311
+picture, 2432 B/row × 1311 rows = 3 188 352 B/frame; at 1.0 → 4864 B/row ×
+2624 rows. A wrong `--source` or `--scale` does not error — it garbles the
+picture (every row shifts), so pass exactly what AXe was given.
+
+**Encoded picture: even dimensions.** H.264 4:2:0 cannot code odd sizes, so an
+odd last column/row is dropped: 603×1311 → **602×1310** (1206×2622 is already
+even). Map the decoded picture onto the full device bounds; the error is under
+one source pixel.
+
+**Stream shape.** Hardware H.264, Main profile, no B-frames (decode order =
+display order), real-time rate control, a keyframe (IDR) at least once a
+second, and **SPS + PPS in front of every keyframe** — any keyframe is a join
+point. No VUI timing: the frame rate lives in the timestamps, not the bitstream.
+
+**Output, `--output framed`:** one record per frame —
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | u32 BE | payload length N |
+| 4 | u8 | flags — bit 0: keyframe (payload starts with SPS, PPS, then the IDR slice) |
+| 5 | 3 | reserved, zero |
+| 8 | u64 BE | presentation timestamp, µs since the first frame (arrival time — a stalled capture shows as a gap, never a speed-up) |
+| 16 | N | one access unit, Annex B (`00 00 00 01` start codes) |
+
+Records are written whole and in order; the first record is always a
+keyframe. A WebCodecs `VideoDecoder` takes the payload as-is (Annex B needs
+no `description`); the codec string comes from the SPS (`avc1.` + profile,
+constraint, level bytes).
+
+**stderr and exit.** One geometry line at start (`602x1310 @30fps … B/frame`),
+then diagnostics only — never parse it. Exit **0** on end of input (a trailing
+partial frame is dropped, with a line on stderr) or when stdout's reader goes
+away (`EPIPE`, no `SIGPIPE` death); **2** on bad arguments; **1** when
+VideoToolbox cannot start or fails mid-stream. Closing its stdin — or killing
+AXe — is how to stop it.
+
+**Measured** (AXe 1.8.0, iOS 27 headless clone, scrolling Settings, framed
+output): 30.3 fps at scale 0.5 (541 frames, keyframes ≤ 1.05 s apart), 30.7 fps
+at 1.0; `ffprobe` decodes every frame of the unframed payload.
+
 ## Notable asymmetries
 
 Deliberate, and worth knowing before "fixing" them:
@@ -210,6 +282,11 @@ Deliberate, and worth knowing before "fixing" them:
   direction, and the banner prints the absolute deadline, which is exact.
 
 ## Testing strategy
+
+**`swift test`** in `helper/` covers the encoder helper's pure logic — argument
+parsing, AXe's frame layout (pinned to measured frame sizes), and the output
+framing. The VideoToolbox path itself is verified by piping a live AXe stream
+through the binary (§ H.264 encoder helper, *Measured*).
 
 **`npm test`** (`node --test`, no dependencies) covers the one module that
 needs no simulator: `shares.js` — TTL and `--share` parsing, token matching,

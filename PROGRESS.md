@@ -51,7 +51,7 @@
 - [ ] **Phase 6b — Gated public sharing (Cloudflare Access)**
   - [ ] 6b.1 `cloudflare-access` named-tunnel provider — Access policy in front of the tunnel
 - [ ] **Phase 7 — Capture pipeline (30 fps H.264)**
-  - [ ] 7.1 Swift encoder helper — raw BGRA on stdin (from `axe stream-video --format bgra`) → VideoToolbox H.264 on stdout; done when an AXe→helper pipe yields a stream `ffprobe` reads at ≥25 fps
+  - [x] 7.1 Swift encoder helper → AXe's raw rows are 64-byte padded; the helper derives the layout from `--source` + `--scale`
   - [ ] 7.2 H.264 hub + authenticated `/video` WebSocket — refcount/grace/generation like `MjpegHub`, keyframe-on-join, slow-client drop, share-expiry `track()`; MJPEG untouched [model: fable]
   - [ ] 7.3 Browser player — WebCodecs → canvas on secure contexts, automatic MJPEG fallback elsewhere; taps still land and ack inside the queue timeout
 - [ ] **Phase 8 — Borrowed conveniences**
@@ -64,25 +64,26 @@
 
 ## Current Status
 
-- **Current phase / sub-phase:** 6.1 — `cloudflared` quick-tunnel provider
+- **Current phase / sub-phase:** 7.2 — H.264 hub + authenticated `/video` WebSocket
 - **State:** not-started
-- **Last completed:** 5.2 (expiring share links — `--share demo=2h`; Phase 5, token & session hardening, is done)
-- **Build:** green (`node --check` ×3) · **Tests:** 21/21 (`npm test` — covers `shares.js` only) · **Simulator-verified:** yes (sandbox clone: 55-check auth/expiry matrix, Chrome watching a share expire, `lan` link opened from a bench iPhone)
+- **Last completed:** 7.1 (Swift encoder helper — `helper/`, `npm run build:helper`; server not wired yet)
+- **Build:** green (`node --check` ×3, `swift build -c release`) · **Tests:** 21/21 `npm test` + 11 `swift test` (helper) · **Simulator-verified:** yes (sandbox clone: AXe → helper at 30.3 fps scale 0.5, 30.7 fps scale 1.0, `ffprobe` decodes every frame)
 
 ---
 
 ## Next Concrete Action
 
-> Implement 6.1 (`cloudflared` anonymous quick tunnel) as one new entry in
-> `remote.js`'s `PROVIDERS` map: `prepare` → `{host: "127.0.0.1"}`; `start({port})`
-> spawns `cloudflared tunnel --url http://127.0.0.1:<port>`, parses the
-> `trycloudflare.com` hostname from its output, and returns the **token-free**
-> base URL (`https://<host>/`) — the server appends `?token=…` per link;
-> `stop` kills the child (mandatory). A missing binary fails at once with the
-> install command. Then verify against a real tunnel that Cloudflare's edge
-> does not buffer the MJPEG stream, and that a short `--share` still cuts the
-> stream at its deadline through the tunnel.
-> 6.1 carries no model tag: an autopilot run still on Fable halts here by design; `/pilot` routes it down to Opus.
+> Implement 7.2 (H.264 hub + authenticated `/video` WebSocket) from
+> `docs/architecture.md` § H.264 encoder helper — the helper's command line,
+> AXe's padded frame layout, and the 16-byte framed output are written there.
+> Spawn `axe stream-video --format bgra --fps <FPS> --scale <SCALE>` and pipe
+> its stdout straight into `helper/.build/release/sim-stream-encoder --source
+> <W>x<H> --scale <SCALE> --fps <FPS>` (fd hand-off, never through Node),
+> where `<W>x<H>` is the device's pixel size from a screenshot's PNG header.
+> Clamp or reject `--scale`/`--fps` outside the helper's ranges (exit 2).
+> Rest of the scope, including `start.sh` building the helper and the done
+> check: `docs/ROADMAP.md` § Phase 7.
+> 7.2 is tagged `[model: fable]`: a non-Fable session halts at the tag gate; `/pilot` routes it to Fable.
 
 ---
 
@@ -104,15 +105,6 @@
 
 - _none_
 
-`/clarify` resolved the PRD verification on 2026-07-31: principle 2 and the
-hosted-infrastructure scope line were amended, and the PRD is now frozen.
-Phase 6b's Cloudflare-domain prerequisite is tracked under Assumptions & Risks
-rather than here — it blocks a post-milestone phase, not the run.
-
-`/clarify` pre-flighted Phases 7–8 on 2026-09-30 (four owner decisions of that
-date in `DECISIONS.md`): they need nothing from the owner. Phase 8b's ngrok
-account is tracked under Assumptions & Risks, like 6b's domain.
-
 ---
 
 ## Assumptions & Risks
@@ -123,7 +115,8 @@ account is tracked under Assumptions & Risks, like 6b's domain.
 - **The operator's own token still never expires** within a run, and it is the one on the `local:` / `--remote` banner lines. Only `--share` links die on their own — hand those out, not the top link.
 - **Tailscale providers were not re-run after 5.2 (expiring share links) changed the provider contract** (`start` now returns a token-free URL). `lan` was verified from a real phone and the Tailscale edit is the same one-line shape, but check the printed links on the next `tailscale-serve`/`-funnel` use.
 - **An iOS 27 sandbox clone was slow while streaming** in Phase 5 verification (`axe tap` ~10 s, screenshot past 10 s); not reproduced on a fresh clone on 2026-09-30 (1.6–2.0 s, 0.5 s). Environmental — recheck before blaming the queue.
-- **Phase 7's 30 fps rests on one measurement** (raw `bgra` 28.6–30.4 fps vs. 7–9.5 for `mjpeg`; static screen, headless clone). AXe caps `--fps` at 30 — this design's ceiling → DECISIONS.md § Phase 7 capture source.
+- **30 fps holds through the encoder while scrolling** (7.1: 30.3 fps at scale 0.5, 30.7 at 1.0, headless clone) — still one host. AXe caps `--fps` at 30 — this design's ceiling → DECISIONS.md § Phase 7 capture source.
+- **AXe's raw frame layout is reverse-engineered** (64-byte row padding; row count padded to 16 at scale 1.0 only), measured on one device size (1206×2622). Another model or AXe version could differ — a garbled/sheared H.264 picture means `FrameLayout.axe` needs a new measurement.
 - **30 fps capture slows taps:** 3.0–3.5 s vs. 1.6–2.0 s, against the queue's 5 s timeout. 7.3 (browser player) must re-measure; input wins over smoothness (PRD principle 5).
 - **The H.264 path only runs on https or `localhost`**, so plain-http `--remote lan` stays on MJPEG by design. Phase 7 runs before 6.1 (the account-free https tunnel), so 7.3 verifies H.264 in desktop Chrome on `localhost` and the MJPEG fallback from a phone over `lan`; the real-iPhone H.264 check waits for 6.1 (not blocking — record it as outstanding, don't halt on it).
 - **Phase 8b needs the owner's ngrok account** (`ngrok` not installed; authtoken in the Keychain as `NGROK_AUTHTOKEN`). A run reaching 8b should halt.

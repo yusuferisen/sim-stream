@@ -153,3 +153,20 @@ the iOS 27 clone while streaming — the same environmental slowness 5.1 saw wit
 `axe tap`;
 the Tailscale providers' one-line URL change was not exercised against a real
 tailnet.
+
+## 2026-09-30 — 7.1 (Swift encoder helper)
+
+New optional SwiftPM package `helper/` → `sim-stream-encoder`: AXe's raw BGRA
+frames on stdin, VideoToolbox H.264 (Main, no B-frames, keyframe ≤ 1 s, SPS +
+PPS on every keyframe) on stdout, as 16-byte-header records (`framed`) or bare
+Annex B (`annexb`); `npm run build:helper` builds it. The surprise: AXe's raw
+frames are **not** `w×h×4` — rows are padded to 64 bytes (603 px → 2432 B/row)
+and at scale 1.0 the row count is padded to 16 (2622 → 2624), so feeding the
+naive size shears the picture. The layout rule was measured at six scales and
+lives in the helper (`--source WxH --scale S`), pinned by tests to the measured
+frame sizes. H.264 4:2:0 can't code odd sizes, so 603×1311 encodes as 602×1310.
+`server.js` / `start.sh` untouched; the contract 7.2 builds on is in
+`docs/architecture.md` § H.264 encoder helper. Tests: `swift test` 11 tests
+(25 cases); live on a sandbox clone, scrolling Settings: 30.3 fps at scale 0.5
+and 30.7 at 1.0 from framed timestamps, keyframes ≤ 1.05 s apart, `ffprobe`
+decoding every frame; `npm test` still 21/21.

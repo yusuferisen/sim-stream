@@ -241,6 +241,7 @@ at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
 | `remote.js`               | Pluggable remote-access providers (LAN / Tailscale Serve / Funnel)   |
 | `public/index.html`       | Single-page client: MJPEG `<img>`, pointer/gesture detection, toolbar |
 | `scripts/start.sh`        | Dev launcher: checks AXe, installs deps, boots simulator, runs server |
+| `helper/`                 | Optional Swift encoder (`npm run build:helper`): AXe raw frames → H.264; contract in `docs/architecture.md` |
 
 ## Limitations
 
