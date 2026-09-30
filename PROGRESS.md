@@ -59,31 +59,46 @@
   - [x] 8.2 Tap by accessibility label
 - [ ] **Phase 8b — `ngrok` provider (needs the owner's ngrok account)**
   - [ ] 8b.1 `ngrok` provider — same provider shape as 6.1; authtoken from the environment, never a repo file
+- [ ] **Phase 9 — Real-device backend (WebDriverAgent)**
+  - [ ] 9.1 Backend seam — today's AXe/`simctl` code behind one interface in `backends/simulator.js`; behaviour identical, checklist passes on a clone [model: fable]
+  - [ ] 9.2 Device video — `--device <udid|role>` opens a WDA session, `ios forward`s its MJPEG server into `MjpegHub`; bounds from `/window/size`; input acks "not supported yet"
+  - [ ] 9.3 Device input — tap/long-press/swipe as W3C actions, `type` via `/wda/keys`, buttons via WDA, `tap-label` via accessibility lookup; unlock before dispatch
+  - [ ] 9.4 H.264 for devices — helper `--input mjpeg`; `/video` from the device at ≥25 fps and a few Mbit/s
 
 ---
 
 ## Current Status
 
-- **Current phase / sub-phase:** 🏁 milestone (safe public sharing) reached — awaiting owner review
-- **State:** milestone-reached
-- **Last completed:** 6.1 (`cloudflared` quick-tunnel provider — `--remote cloudflared`)
-- **Build:** green (`node --check` ×6) · **Tests:** 99/99 `npm test` + 11 `swift test` (helper; untouched) · **Simulator-verified:** yes (sandbox clone through real quick tunnels: MJPEG + H.264, share expiry at the edge; QA bench iPhone Safari showed `H.264` and taps landed)
+- **Current phase / sub-phase:** 9.1 — backend seam (real-device backend, Phase 9)
+- **State:** not-started
+- **Last completed:** 6.1 (`cloudflared` quick-tunnel provider) — the 🏁 Safe public sharing milestone is reached and awaits the owner's review before its box is ticked
+- **Build:** green (`node --check` ×6) · **Tests:** 99/99 `npm test` + 11 `swift test` · **Simulator-verified:** yes (6.1: sandbox clone through real quick tunnels; QA bench iPhone Safari showed `H.264` and taps landed)
 
 ---
 
 ## Next Concrete Action
 
-> Owner review of the 🏁 Safe public sharing milestone (cookie handoff,
-> expiring `--share` links, the `cloudflared` quick tunnel), then tick the
-> milestone box. Past it, every remaining phase needs an owner prerequisite:
-> 6b (Cloudflare Access gate) needs a domain on a Cloudflare account; 8b
-> (ngrok provider) needs an ngrok account and authtoken.
+> Implement 9.1 (backend seam): create `backends/simulator.js` wrapping
+> `pickSimulator`/boot, `boundsForDeviceType`, the AXe MJPEG spawn, the H.264
+> pipeline plan, `dispatchInput`'s AXe calls and `runScreenshot` behind one
+> interface (`bounds`, `openMjpeg()`, `h264Pipeline()`, `input(evt)`,
+> `screenshot(dest)`, `stop()`); make `server.js`, `MjpegHub` and the H.264 hub
+> call only that interface; write the contract into `docs/architecture.md`.
+> Behaviour must be identical — run the full checklist on a sandbox clone.
+> Scope: `docs/ROADMAP.md` § Phase 9; defaults: `DECISIONS.md` § Device backend
+> mechanics. 9.1 is tagged `[model: fable]`.
+> Separately, the owner still owes a review of the 🏁 Safe public sharing
+> milestone (tick its box when satisfied).
 
 ---
 
 ## Open Decisions (reversible — defaults chosen, proceeding)
 
 - **Multi-simulator support** → chose **out of scope; one simulator per server** → DECISIONS.md § Build vs. adopt
+- **Host port for the device's MJPEG forward (9.2)** → chose **a free port picked at startup** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
+- **Device name in the banner and `hello` (9.2)** → chose **`ios info` (`DeviceName`, `ProductType`); WDA's device info only as fallback** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
+- **Special keys and hardware buttons on a device (9.3)** → chose **map what WDA has (return/delete/tab/space; home, lock=side-button, siri), refuse the rest with an error ack** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
+- **Helper JPEG input (9.4)** → chose **ImageIO decode, frames found by SOI/EOI scan, size from the first SOF; the server fetches the MJPEG and pipes it to the helper's stdin** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
 
 ---
 
@@ -106,6 +121,8 @@
 - **Taps take 1.0–2.0 s with the page playing H.264** (7.3, measured in Chrome on a sandbox clone; MJPEG alone: 1.0–1.5 s) against the queue's 5 s timeout. Input wins over smoothness (PRD principle 5): lower the capture rate before loosening the queue.
 - **H.264 in iPhone Safari was checked once** (6.1, the Cloudflare tunnel, QA bench iPhone 16e): header `H.264`, taps land. The MJPEG fallback has still only been seen in Chrome, not on a phone.
 - **The server's H.264 pipeline still has no heartbeat or reconnect limit** — a hung encoder stays `live`. The page copes (falls back after 4 s without frames, never reconnects); a script client must do the same.
+- **Device mode (Phase 9) is bench-only:** WDA must already be running (`qa-device up <role>`), `ios` (go-ios) is required for the port-forward, and the tool cannot tell a bench device from a personal one — the bench rule is the guard. A real device carries real Apple IDs: keep device shares short.
+- **The QuickTime-mirror capture route is unavailable on this Mac** (macOS 27 / iOS 26.6: no AVFoundation muxed device appears even when enabled), so 60 fps over USB is not on the table; WDA's 29 fps MJPEG is the ceiling for devices.
 - **Phase 8b needs the owner's ngrok account** (`ngrok` not installed; authtoken in the Keychain as `NGROK_AUTHTOKEN`). A run reaching 8b should halt.
 - **Quick tunnels have no uptime guarantee.** One 6.1 run dropped every tunnel connection at once after ~111 s (unexplained; tunnel-level `ERR` lines are now logged as `[remote:cloudflared]`). A share meant to last hours may be better on Tailscale Funnel.
 - **Phase 6b needs a domain on a Cloudflare account** (plus a named tunnel and an Access policy) before it can be built or verified. It sits past the milestone for exactly this reason; a run reaching it should halt.

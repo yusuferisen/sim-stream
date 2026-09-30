@@ -651,3 +651,134 @@ in-flight requests, and the MJPEG response never ends; the exit hook covers the
 **Settled by measurement:** Cloudflare's edge does **not** buffer MJPEG (same
 frame rate and gaps as `localhost`), so the README recommends the quick tunnel
 as an equal public route beside Funnel — no caveat needed.
+
+---
+
+## 2026-09-30 — Real devices join the tool as a second backend (PRD deviation)
+
+**Chose:** add a **real-device backend** — a USB-tethered iPhone or iPad from
+the QA bench, driven through the WebDriverAgent stack the bench already runs —
+behind a seam that the existing simulator code moves behind first. Phase 9.
+Settled with the owner after a measurement spike on the primary bench iPhone
+(16e, iOS 26.6.2).
+
+**Why:** the wedge — open a link on whatever is in your hand and drive the
+thing an agent just built — applies to a real device at least as much as to a
+simulator, and the measured numbers say a real device is the *more*
+responsive target:
+
+| | Bench iPhone via WebDriverAgent | Simulator (today) |
+|---|---|---|
+| Picture | 29 fps JPEG from WDA's built-in MJPEG server (½ scale, q60: ~4.4 MB/s; full: ~10.6 MB/s; at 10 fps: ~1.5 MB/s) | 30 fps H.264 / ~7 fps MJPEG |
+| First frame | < 0.1 s | ~0.5 s |
+| Tap (W3C actions) | ~0.5 s | 1–2 s |
+| Home button | 0.5 s | uncertain on iOS 27 |
+| Screenshot | 0.33 s | ~0.5 s |
+
+**PRD deviation, recorded here because the PRD is frozen:** `docs/PRD.md`
+scopes the tool to "a single running iOS Simulator". The scope becomes *one
+simulator **or** one prepared physical device per server*. Every principle
+holds unchanged: a URL is still the credential, nothing hosted is required,
+one process, input correctness over smoothness. What does **not** change:
+"one at a time", no accounts, no multi-device dashboards.
+
+**Rejected:**
+- **The QuickTime-mirror capture device** (the iPhone screen as a macOS
+  AVFoundation "muxed" device, 60 fps H.264 over USB). Enabled at the
+  CoreMediaIO level with the phone awake and unlocked, it does not enumerate
+  on macOS 27 / iOS 26.6 — only Continuity Camera devices appear. A USB-level
+  reimplementation (`qvh`) exists but needs exclusive device access, which
+  would fight the bench tunnel, and is untested on current iOS.
+- **go-ios's own MJPEG stream** (`ios screenshot --stream`): 2.7 fps.
+- **A separate tool.** Auth, shares, tunnels, the player, the gallery and
+  tap-by-label are all target-agnostic; only capture, input, bounds and
+  screenshot know what they are driving. A seam is the honest shape.
+
+**Consequence:** `docs/architecture.md` gains a backend contract when 9.1
+lands; `docs/OVERVIEW.md` and the README gain device usage when 9.2 lands.
+
+---
+
+## 2026-09-30 — Device backend mechanics (Phase 9 defaults, reversible)
+
+Chosen in planning so the run does not stop to ask. Each is cheap to change.
+
+- **Video source is WDA's MJPEG server** (device port 9100, reached through
+  `ios forward`), fed into the existing `MjpegHub`. Frame rate, scale and
+  quality come from the same `--fps` / `--scale` / `--quality` flags, applied
+  as WDA session settings (`mjpegServerFramerate`, `mjpegScalingFactor`,
+  `mjpegServerScreenshotQuality`).
+- **H.264 for devices reuses the Phase 7 helper** with a JPEG input mode
+  (decode → VideoToolbox), so remote viewers get the low-bandwidth path. It is
+  the last slice; the MJPEG path stands alone before it.
+- **Selection:** `--device <udid>` with `--wda <url>` (default
+  `http://localhost:8100`). When `qa-device` is on PATH, `--device
+  primary|secondary|tablet` resolves both. `--device` and `--udid` are
+  mutually exclusive: one target per process, as before.
+- **The tool does not start WDA or the tunnel.** Missing WDA fails at startup
+  with the command that fixes it (`qa-device up <role>`), the same policy as a
+  missing `axe` or `cloudflared`. `ios` (go-ios) becomes a required binary
+  **for device mode only**.
+- **Bounds come from WDA** (`/window/size`, points) — not the hand-maintained
+  `boundsForDeviceType` table, which stays simulator-only.
+- **Input maps 1:1 onto today's event set** (tap, long-press, swipe, type,
+  key, button, tap-label) so the client does not change. Multi-finger
+  gestures, which WDA could do and the simulator cannot, are **out of scope**
+  for Phase 9 — a later, client-visible addition.
+- **Wake before input:** the bench devices auto-lock after 3 min; the backend
+  checks `/wda/locked` and unlocks (they are passcode-free) before dispatching.
+- **Never a personal device.** The README states it; the tool cannot enforce
+  it. The bench rule (`~/.dotfiles/docs/device-bench.md`) is the guard.
+
+**Rejected:** starting WDA from the tool (Xcode signing and device trust are
+one-time owner work, not something a server should retry); a device-specific
+client (the whole point is that the page does not care).
+
+---
+
+## 2026-09-30 — 9.1 tagged `[model: fable]`; the rest of Phase 9 untagged
+
+**Chose:** tag only 9.1, the backend seam.
+
+**Why:** it is the one slice that refactors *working* code — every simulator
+path moves behind an interface, and the simulator has no automated coverage
+beyond the import-safe modules. A regression there fails silently until the
+manual checklist runs. 9.2–9.4 are new code against a live device, where
+failures are loud (no picture, tap doesn't land, `ffprobe` disagrees).
+
+**Rejected:** tagging nothing (cheapest; the gatekeeper's manual checklist
+would be the only net under the refactor) and also tagging the input slice
+(coordinate mistakes there are visible on the device at once).
+
+---
+
+## 2026-09-30 — Phase 9 pre-flight defaults (reversible, chosen by `/clarify`)
+
+Small calls a fresh session would otherwise have to make mid-run. Each is
+cheap to change.
+
+- **Forwarded MJPEG port:** the backend asks the OS for a free host port for
+  `ios forward` rather than hardcoding 9100 on the host, so two servers (or a
+  stray forward) cannot collide. The device side stays WDA's default 9100.
+- **Device identity** for the banner and the `hello` frame comes from
+  `ios info --udid` (`DeviceName`, `ProductType`; go-ios is required in device
+  mode anyway). WDA's `/wda/device/info` is only a fallback: on the bench it
+  reports the generic `iPhone` / `iPhone`.
+- **Special keys:** map what WDA's `/wda/keys` can express (return, delete,
+  tab, space); refuse the rest with an error ack rather than sending a
+  best-guess character.
+- **Hardware buttons on a device:** `home` → `pressButton home`; `lock` and
+  `side-button` → `/wda/lock` (they are the same button on a device); `siri`
+  → `/wda/siri/activate`; `screenshot` unchanged; `apple-pay` refused with an
+  error ack (no WDA equivalent). Volume buttons exist in WDA but not in the
+  client — not exposed in Phase 9.
+- **Helper JPEG input:** decode with ImageIO (simplest, fast enough at ½
+  scale), locate frames by scanning for JPEG SOI/EOI markers so the helper
+  does not care about multipart headers, and take the pixel size from the
+  first frame's SOF header. **The server fetches** the forwarded MJPEG over
+  HTTP and pipes the body into the helper's stdin; the helper stays
+  stdin-only with no networking. 4–10 MB/s through Node is fine — the
+  "never through Node" rule guards the 95–380 MB/s raw BGRA path, not this.
+- **WDA session recovery:** on a `404`/invalid-session answer, re-create the
+  session and retry the request once; a second failure surfaces as an error
+  ack. Never a retry loop.
