@@ -1,13 +1,18 @@
 // sim-stream: serves an iOS Simulator to a web browser.
 //
 // Channels to each client:
-//   - GET /stream  — MJPEG, from `axe stream-video --format mjpeg` (stdout
-//     proxied after stripping AXe's HTTP preamble).
+//   - GET /stream  — MJPEG, the backend's multipart body fanned out by the
+//     hub in mjpeg.js.
 //   - WS /video    — H.264 at up to 30 fps, when the optional encoder helper
-//     is built: `axe stream-video --format bgra` piped into it, its records
-//     fanned out as binary messages (h264.js). MJPEG stays the fallback.
-//   - WS /ws       — JSON input events (tap/swipe/type/button/key),
-//     dispatched as AXe commands through a FIFO queue.
+//     is built: the backend's capture pipeline, its records fanned out as
+//     binary messages (h264.js). MJPEG stays the fallback.
+//   - WS /ws       — JSON input events (tap/swipe/type/button/key), handed to
+//     the backend, which runs them one at a time.
+//
+// Everything that knows what is being driven — today an iOS Simulator through
+// the AXe CLI (backends/simulator.js) — sits behind the backend interface in
+// docs/architecture.md § Backends. This file is target-agnostic: auth, routes,
+// the WebSocket endpoints, the banner and shutdown.
 //
 // Access is by token: the operator's own plus any expiring `--share` tokens,
 // all held in the in-memory registry in shares.js.
@@ -16,8 +21,7 @@
 
 import express from "express";
 import { WebSocketServer } from "ws";
-import { spawn, execFileSync } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -26,9 +30,10 @@ import { fileURLToPath } from "node:url";
 
 import { getRemoteProvider } from "./remote.js";
 import { ShareRegistry, mintToken, parseShareSpec } from "./shares.js";
-import { H264Hub, parsePngSize, planCapture } from "./h264.js";
+import { H264Hub } from "./h264.js";
+import { MjpegHub } from "./mjpeg.js";
 import { ThumbCache, galleryDir, listScreenshots, renderGalleryPage, resolveScreenshot, screenshotName, sipsArgs } from "./gallery.js";
-import { axeErrorLine, tapLabelArgs } from "./tap-label.js";
+import { createSimulatorBackend } from "./backends/simulator.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -195,541 +200,6 @@ function formatTtl(ms) {
   return parts.join(" ") || "0s";
 }
 
-// --- Simulator discovery ---------------------------------------------------
-
-function listSimulators() {
-  const json = execFileSync("xcrun", ["simctl", "list", "devices", "available", "--json"], { encoding: "utf8" });
-  const data = JSON.parse(json);
-  const all = [];
-  for (const runtime of Object.keys(data.devices)) {
-    for (const d of data.devices[runtime]) {
-      if (!d.isAvailable) continue;
-      all.push({
-        udid: d.udid,
-        name: d.name,
-        state: d.state,
-        runtime: runtime.replace("com.apple.CoreSimulator.SimRuntime.", ""),
-        deviceType: d.deviceTypeIdentifier.replace("com.apple.CoreSimulator.SimDeviceType.", ""),
-      });
-    }
-  }
-  return all;
-}
-
-function pickSimulator() {
-  const list = listSimulators();
-  if (args.udid) {
-    const found = list.find((d) => d.udid === args.udid);
-    if (!found) throw new Error(`Simulator ${args.udid} not found`);
-    return found;
-  }
-  const booted = list.find((d) => d.state === "Booted");
-  if (booted) return booted;
-  const preferred =
-    list.find((d) => d.deviceType.startsWith("iPhone-17-Pro") && !d.deviceType.endsWith("Max")) ||
-    list.find((d) => d.deviceType.startsWith("iPhone-17")) ||
-    list.find((d) => d.deviceType.startsWith("iPhone"));
-  if (!preferred) throw new Error("No iPhone simulator available");
-  return preferred;
-}
-
-function ensureBooted(udid) {
-  const state = listSimulators().find((d) => d.udid === udid)?.state;
-  if (state === "Booted") return;
-  console.log(`[sim] Booting ${udid}...`);
-  try {
-    execFileSync("xcrun", ["simctl", "boot", udid], { stdio: "inherit" });
-  } catch {
-    // "already booted" is fine
-  }
-  try {
-    execFileSync("open", ["-a", "Simulator"], { stdio: "ignore" });
-  } catch {}
-  execFileSync("xcrun", ["simctl", "bootstatus", udid, "-b"], { stdio: "inherit" });
-}
-
-// --- AXe binary resolution -------------------------------------------------
-
-function axeBinary() {
-  for (const p of ["/opt/homebrew/bin/axe", "/usr/local/bin/axe", "axe"]) {
-    try {
-      execFileSync(p, ["--version"], { stdio: "pipe" });
-      return p;
-    } catch {}
-  }
-  throw new Error("axe CLI not found. Install with: brew install cameroncooke/axe/axe");
-}
-
-const AXE = axeBinary();
-
-// --- Point-bounds lookup (portrait, logical pixels) -----------------------
-//
-// Used for mapping normalized browser coordinates → simulator points.
-// iOS logical dimensions don't change between sim and device for a given
-// model, so hardcoded values are safe. Fallback preserves aspect for
-// unknown devices.
-
-function boundsForDeviceType(type = "") {
-  if (type.includes("iPhone-17-Pro-Max") || type.includes("iPhone-16-Pro-Max")) return { w: 440, h: 956 };
-  if (type.includes("iPhone-17-Pro") || type.includes("iPhone-16-Pro")) return { w: 402, h: 874 };
-  if (type.includes("iPhone-Air")) return { w: 402, h: 874 };
-  if (type.includes("iPhone-17") || type.includes("iPhone-16")) return { w: 393, h: 852 };
-  if (type.includes("iPhone-16e") || type.includes("iPhone-15") || type.includes("iPhone-14")) return { w: 390, h: 844 };
-  if (type.includes("iPhone-SE")) return { w: 375, h: 667 };
-  if (type.includes("iPad-Pro-13")) return { w: 1032, h: 1376 };
-  if (type.includes("iPad-Pro-11")) return { w: 834, h: 1194 };
-  if (type.includes("iPad-Air-13") || type.includes("iPad-Air-11")) return { w: 820, h: 1180 };
-  if (type.includes("iPad-mini")) return { w: 744, h: 1133 };
-  if (type.includes("iPad")) return { w: 820, h: 1180 };
-  return { w: 393, h: 852 };
-}
-
-// --- MJPEG streaming (pass-through) ---------------------------------------
-//
-// AXe's `stream-video --format mjpeg` emits a complete HTTP response on
-// stdout: status line, headers, then multipart body. We strip the HTTP
-// preamble and pipe the multipart body to all connected HTTP clients.
-// Boundary is literally `--mjpegstream` (with the leading dashes included
-// in the value) — we preserve it verbatim.
-
-class MjpegHub extends EventEmitter {
-  constructor(udid) {
-    super();
-    this.udid = udid;
-    this.clients = new Set();
-    this.proc = null;
-    this.generation = 0; // incremented on each spawn; exit handler only acts on matching gen
-    this.headerStripped = false;
-    this.preBuffer = Buffer.alloc(0);
-    this.stopTimer = null;
-    this.graceMs = 5000;
-    this.status = "idle"; // idle | live | dead
-  }
-
-  setStatus(status) {
-    if (this.status === status) return;
-    this.status = status;
-    this.emit("status", status);
-  }
-
-  addClient(res) {
-    if (this.stopTimer) {
-      clearTimeout(this.stopTimer);
-      this.stopTimer = null;
-    }
-    this.clients.add(res);
-    const drop = () => {
-      if (!this.clients.has(res)) return;
-      this.clients.delete(res);
-      if (this.clients.size === 0) this.scheduleStop();
-    };
-    res.on("close", drop);
-    res.on("error", drop);
-    this.start();
-  }
-
-  scheduleStop() {
-    if (this.stopTimer) return;
-    this.stopTimer = setTimeout(() => {
-      this.stopTimer = null;
-      if (this.clients.size === 0) this.stop();
-    }, this.graceMs);
-  }
-
-  start() {
-    if (this.proc) return;
-    const gen = ++this.generation;
-    const cmdArgs = [
-      "stream-video",
-      "--udid", this.udid,
-      "--format", "mjpeg",
-      "--fps", String(FPS),
-      "--quality", String(QUALITY),
-      "--scale", String(SCALE),
-    ];
-    console.log(`[mjpeg] spawn: ${AXE} ${cmdArgs.join(" ")}`);
-    const proc = spawn(AXE, cmdArgs, { stdio: ["ignore", "pipe", "pipe"] });
-    this.proc = proc;
-    this.headerStripped = false;
-    this.preBuffer = Buffer.alloc(0);
-    this.setStatus("live");
-    proc.stdout.on("data", (c) => {
-      if (this.generation === gen) this.onData(c);
-    });
-    proc.stderr.on("data", (d) => {
-      // Filter AXe's "Captured N frames (X FPS actual)" progress noise
-      const line = d.toString();
-      if (/^Captured \d+ frames/m.test(line) || /^Streamed \d+ frames/m.test(line)) return;
-      process.stderr.write(`[axe stream] ${line}`);
-    });
-    proc.on("exit", (code, sig) => {
-      console.log(`[mjpeg] axe stream-video exited (code=${code} sig=${sig})`);
-      // Only act if we're still the current generation — otherwise a newer
-      // spawn has already taken over and we must not touch its state.
-      if (this.generation !== gen) return;
-      this.proc = null;
-      const toClose = [...this.clients];
-      this.clients.clear();
-      for (const c of toClose) {
-        try { c.end(); } catch {}
-      }
-      this.setStatus(code === 0 ? "idle" : "dead");
-    });
-  }
-
-  stop() {
-    if (this.proc) {
-      this.proc.kill("SIGTERM");
-      this.proc = null;
-    }
-    this.setStatus("idle");
-  }
-
-  onData(chunk) {
-    if (!this.headerStripped) {
-      this.preBuffer = Buffer.concat([this.preBuffer, chunk]);
-      const end = this.preBuffer.indexOf("\r\n\r\n");
-      if (end < 0) return;
-      chunk = this.preBuffer.slice(end + 4);
-      this.preBuffer = null;
-      this.headerStripped = true;
-    }
-    if (chunk.length === 0) return;
-    for (const res of this.clients) {
-      try {
-        res.write(chunk);
-      } catch {
-        this.clients.delete(res);
-      }
-    }
-  }
-}
-
-// --- H.264 capture pipeline -----------------------------------------------
-//
-// `axe stream-video --format bgra | sim-stream-encoder`, as two child
-// processes. The hub that owns their lifecycle and fans the encoder's records
-// out to `/video` viewers is in h264.js; this is only the process plumbing.
-
-// Decides once, at startup, whether the H.264 path exists for this run.
-// Returns planCapture()'s result, or { ok: false, reason }. Never throws:
-// every failure just means "MJPEG only".
-async function planH264(udid) {
-  try {
-    fs.accessSync(ENCODER, fs.constants.X_OK);
-  } catch {
-    return { ok: false, reason: "encoder helper not built (npm run build:helper)" };
-  }
-  // The simulator's size in PIXELS, from a screenshot's PNG header. The
-  // bounds table is in points and cannot stand in for it: a wrong size does
-  // not fail, it shears every row of the picture.
-  let dir = null;
-  try {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), "sim-stream-"));
-    const shot = path.join(dir, "probe.png");
-    await runScreenshot(udid, shot);
-    const head = Buffer.alloc(24);
-    const fd = fs.openSync(shot, "r");
-    try { fs.readSync(fd, head, 0, 24, 0); } finally { fs.closeSync(fd); }
-    const source = parsePngSize(head);
-    if (!source) return { ok: false, reason: "could not read the simulator's pixel size from a screenshot" };
-    return planCapture({ source, scale: SCALE, fps: H264_FPS });
-  } catch (e) {
-    return { ok: false, reason: `could not measure the simulator screen (${e.message})` };
-  } finally {
-    if (dir) fs.rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-// Spawns the pipeline for one hub generation. Returns an emitter with "data"
-// (chunks of encoder records), "exit" (once, when both processes are gone)
-// and kill() — the shape H264Hub expects.
-function spawnH264Pipeline(udid, plan) {
-  const axeArgs = [
-    "stream-video",
-    "--udid", udid,
-    "--format", "bgra",
-    "--fps", String(plan.fps),
-    "--scale", String(plan.scale),
-  ];
-  // The helper derives AXe's padded frame layout from --source and --scale,
-  // so it must be told exactly what AXe was told.
-  const encArgs = [
-    "--source", `${plan.source.width}x${plan.source.height}`,
-    "--scale", String(plan.scale),
-    "--fps", String(plan.fps),
-  ];
-  console.log(`[h264] spawn: ${AXE} ${axeArgs.join(" ")} | sim-stream-encoder ${encArgs.join(" ")}`);
-
-  // A spawn that fails for lack of file descriptors comes back without its
-  // stdio streams (and reports through "error"); there is no pipeline to build.
-  const abandon = (procs, message) => {
-    for (const proc of procs) {
-      proc.on("error", () => {});
-      proc.kill("SIGKILL");
-    }
-    throw new Error(message);
-  };
-  const axe = spawn(AXE, axeArgs, { stdio: ["ignore", "pipe", "pipe"] });
-  if (!axe.stdout || !axe.stderr) abandon([axe], "could not spawn axe");
-  // AXe's stdout is handed to the helper as its stdin — a file descriptor, not
-  // a Node stream: the raw frames are ~95 MB/s at the default scale and must
-  // never pass through this process.
-  let enc;
-  try {
-    enc = spawn(ENCODER, encArgs, { stdio: [axe.stdout, "pipe", "pipe"] });
-  } catch (e) {
-    abandon([axe], `could not spawn the encoder (${e.message})`);
-  } finally {
-    // Drop our copy of the read end. While we held it, a dead helper would
-    // leave AXe writing into a pipe nobody reads, instead of getting EPIPE.
-    axe.stdout.destroy();
-  }
-  if (!enc.stdout || !enc.stderr) abandon([axe, enc], "could not spawn the encoder");
-
-  const pipeline = new EventEmitter();
-  const procs = [["axe", axe], ["encoder", enc]];
-  const running = (proc) => proc.exitCode === null && proc.signalCode === null;
-  const ends = [];
-  let alive = procs.length;
-  let killed = false;
-  let killTimer = null;
-
-  pipeline.kill = () => {
-    if (killed) return;
-    killed = true;
-    for (const [, proc] of procs) if (running(proc)) proc.kill("SIGTERM");
-    killTimer = setTimeout(() => {
-      for (const [, proc] of procs) if (running(proc)) proc.kill("SIGKILL");
-    }, 2000);
-    killTimer.unref();
-  };
-
-  for (const [name, proc] of procs) {
-    let done = false;
-    const end = (how) => {
-      if (done) return;
-      done = true;
-      ends.push(`${name} ${how}`);
-      // One half gone means the stream is over; take the other half with it
-      // rather than trusting EOF/EPIPE to get there.
-      pipeline.kill();
-      if (--alive > 0) return;
-      clearTimeout(killTimer);
-      pipeline.emit("exit", ends.join(", "));
-    };
-    proc.on("exit", (code, sig) => end(sig ? `killed by ${sig}` : `exited ${code}`));
-    proc.on("error", (e) => end(`failed (${e.message})`));
-  }
-
-  enc.stdout.on("data", (chunk) => pipeline.emit("data", chunk));
-  enc.stdout.on("error", () => {});
-  // AXe narrates every raw stream on stderr (a banner with an ffmpeg hint,
-  // then progress counters). Only what is not that routine chatter is shown.
-  const chatter = /^(\s*$|Starting BGRA video stream|Format: bgra|Note: This is raw pixel data|\s+axe stream-video |Press Ctrl\+C|BGRA stream |Stopping BGRA stream|Captured \d+ frames|Streamed \d+ frames)/;
-  const relay = (stream, prefix, skip) => {
-    let partial = "";
-    stream.on("data", (d) => {
-      const lines = (partial + d.toString()).split("\n");
-      partial = lines.pop();
-      // A child that never ends its line must not grow this without bound.
-      if (partial.length > 4096) lines.push(partial), partial = "";
-      for (const line of lines) {
-        if (!skip?.test(line)) process.stderr.write(`${prefix} ${line}\n`);
-      }
-    });
-    stream.on("end", () => {
-      if (partial && !skip?.test(partial)) process.stderr.write(`${prefix} ${partial}\n`);
-    });
-  };
-  relay(axe.stderr, "[axe video]", chatter);
-  relay(enc.stderr, "[encoder]");
-  return pipeline;
-}
-
-// --- AXe command queue (input) --------------------------------------------
-
-class CommandQueue {
-  constructor(udid) {
-    this.udid = udid;
-    this.queue = [];
-    this.running = false;
-  }
-
-  push(argv) {
-    return new Promise((resolve, reject) => {
-      this.queue.push({ argv, resolve, reject });
-      this.drain();
-    });
-  }
-
-  async drain() {
-    if (this.running) return;
-    this.running = true;
-    while (this.queue.length > 0) {
-      const job = this.queue.shift();
-      try {
-        job.resolve(await this.runAxe(job.argv));
-      } catch (e) {
-        job.reject(e);
-      }
-    }
-    this.running = false;
-  }
-
-  runAxe(argv) {
-    return new Promise((resolve, reject) => {
-      const full = [...argv, "--udid", this.udid];
-      // `axe type` sends one HID event per char; long strings take real time.
-      // A tap by label or id first reads the accessibility tree, which can
-      // take several seconds while the screen is mid-transition (7 s seen).
-      // Other commands (tap, swipe, button, key) are fast; 5s is plenty.
-      const timeoutMs = argv[0] === "type"
-        ? Math.max(10_000, (argv[1]?.length || 0) * 80)
-        : argv[0] === "tap" && /^--(label|id)=/.test(argv[1] ?? "")
-          ? 15_000
-          : 5000;
-      const proc = spawn(AXE, full, { stdio: ["ignore", "pipe", "pipe"] });
-      let stdout = "", stderr = "";
-      proc.stdout.on("data", (d) => (stdout += d.toString()));
-      proc.stderr.on("data", (d) => (stderr += d.toString()));
-      const timer = setTimeout(() => {
-        proc.kill("SIGKILL");
-        reject(new Error(`axe ${argv[0]} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      proc.on("exit", (code) => {
-        clearTimeout(timer);
-        if (code === 0) resolve(stdout);
-        else reject(Object.assign(new Error(`axe ${argv.join(" ")} exit=${code} ${stderr.trim()}`), { stderr }));
-      });
-      proc.on("error", (e) => {
-        clearTimeout(timer);
-        reject(e);
-      });
-    });
-  }
-}
-
-// --- Input event dispatch -------------------------------------------------
-
-// HID keycodes for common keys (USB HID usage IDs)
-const KEYCODES = {
-  return: 40, enter: 40,
-  escape: 41,
-  backspace: 42,
-  tab: 43,
-  space: 44,
-  right: 79, left: 80, down: 81, up: 82,
-  home: 74, end: 77,
-  pageup: 75, pagedown: 78,
-  delete: 76,
-};
-
-async function dispatchInput(queue, bounds, evt) {
-  const pt = (nx, ny) => ({
-    x: Math.round(Math.max(0, Math.min(1, nx ?? 0)) * bounds.w),
-    y: Math.round(Math.max(0, Math.min(1, ny ?? 0)) * bounds.h),
-  });
-
-  switch (evt.type) {
-    case "tap": {
-      const p = pt(evt.x, evt.y);
-      // `physical` = a touch down/up pair. AXe's default for a coordinate tap
-      // (FBSimulator tapAt) acks but lands nowhere on iOS 27 simulators.
-      await queue.push(["tap", "-x", String(p.x), "-y", String(p.y), "--tap-style", "physical"]);
-      return;
-    }
-    case "tap-label": {
-      const argv = tapLabelArgs(evt.text);
-      try {
-        await queue.push(argv);
-      } catch (e) {
-        // AXe's own words ("No accessibility element matched --label 'X'.")
-        // are the viewer's error toast; the full output stays in the log.
-        if (e.stderr === undefined) throw e;
-        console.error(`[ws] ${e.message}`);
-        throw new Error(axeErrorLine(e.stderr) || e.message);
-      }
-      return { detail: evt.text.trim() }; // tapLabelArgs() proved it a string
-    }
-    case "long-press": {
-      const p = pt(evt.x, evt.y);
-      const sec = (evt.duration || 800) / 1000;
-      await queue.push([
-        "touch",
-        "-x", String(p.x),
-        "-y", String(p.y),
-        "--down", "--up",
-        "--delay", String(sec),
-      ]);
-      return;
-    }
-    case "swipe": {
-      const a = pt(evt.fromX, evt.fromY);
-      const b = pt(evt.toX, evt.toY);
-      const sec = (evt.duration || 300) / 1000;
-      await queue.push([
-        "swipe",
-        "--start-x", String(a.x),
-        "--start-y", String(a.y),
-        "--end-x", String(b.x),
-        "--end-y", String(b.y),
-        "--duration", String(sec),
-      ]);
-      return;
-    }
-    case "type": {
-      if (!evt.text) return;
-      await queue.push(["type", evt.text]);
-      return;
-    }
-    case "key": {
-      const code = typeof evt.key === "number" ? evt.key : KEYCODES[String(evt.key).toLowerCase()];
-      if (!code) throw new Error(`unknown key: ${evt.key}`);
-      await queue.push(["key", String(code)]);
-      return;
-    }
-    case "button": {
-      const allowed = ["home", "lock", "side-button", "siri", "apple-pay", "screenshot"];
-      const name = evt.name;
-      if (name === "screenshot") {
-        await fs.promises.mkdir(GALLERY_DIR, { recursive: true });
-        const dest = path.join(GALLERY_DIR, screenshotName());
-        await runScreenshot(queue.udid, dest);
-        console.log(`[button] screenshot saved to ${dest}`);
-        return { detail: `saved to ${tildePath(dest)}` };
-      }
-      if (!allowed.includes(name)) throw new Error(`unknown button: ${name}`);
-      await queue.push(["button", name]);
-      return;
-    }
-    default:
-      throw new Error(`unknown event type: ${evt.type}`);
-  }
-}
-
-// Async screenshot via simctl. Does NOT go through the AXe command queue,
-// which is reserved for HID input, but still avoids blocking the event loop
-// the way execFileSync would.
-function runScreenshot(udid, dest) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn("xcrun", ["simctl", "io", udid, "screenshot", dest], { stdio: "ignore" });
-    const timer = setTimeout(() => {
-      proc.kill("SIGKILL");
-      reject(new Error("screenshot timed out"));
-    }, 10_000);
-    proc.on("exit", (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`simctl screenshot exit=${code}`));
-    });
-    proc.on("error", (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
-  });
-}
-
 // Writes a JPEG thumbnail of `src` to `dest` with macOS's built-in `sips`.
 function runSips(src, dest) {
   return new Promise((resolve, reject) => {
@@ -752,21 +222,43 @@ function runSips(src, dest) {
 
 // --- Server ---------------------------------------------------------------
 
+// The screenshot control is the one input the backend does not translate: the
+// destination (the gallery folder) and the toast text are the server's, so it
+// is routed to `screenshot()` here; everything else is `input()`.
+async function dispatchInput(backend, evt) {
+  if (evt.type === "button" && evt.name === "screenshot") {
+    await fs.promises.mkdir(GALLERY_DIR, { recursive: true });
+    const dest = path.join(GALLERY_DIR, screenshotName());
+    await backend.screenshot(dest);
+    console.log(`[button] screenshot saved to ${dest}`);
+    return { detail: `saved to ${tildePath(dest)}` };
+  }
+  return backend.input(evt);
+}
+
 async function main() {
-  const sim = pickSimulator();
-  console.log(`[sim] selected: ${sim.name} (${sim.udid}) state=${sim.state}`);
-  ensureBooted(sim.udid);
+  // Everything that knows the target is a simulator lives behind the backend
+  // (docs/architecture.md § Backends): which one, its bounds, the MJPEG source,
+  // the H.264 pipeline, input and screenshots.
+  const backend = await createSimulatorBackend({
+    udid: args.udid || null,
+    mjpeg: { fps: FPS, quality: QUALITY, scale: SCALE },
+    h264: { encoder: ENCODER, fps: H264_FPS, scale: SCALE },
+    log: (line) => console.log(line),
+  });
+  const sim = backend.target;
+  const { bounds } = backend;
 
-  const hub = new MjpegHub(sim.udid);
-  const queue = new CommandQueue(sim.udid);
+  const hub = new MjpegHub({
+    open: () => backend.openMjpeg(),
+    log: (line) => console.log(`[mjpeg] ${line}`),
+  });
 
-  const bounds = boundsForDeviceType(sim.deviceType);
-
-  // The H.264 path is decided once, here: it exists for this run only if the
-  // helper is built and the simulator's pixel size could be measured. Anything
-  // else is MJPEG exactly as before — `videoHub` stays null and `/video`
-  // answers 404.
-  const plan = await planH264(sim.udid);
+  // The H.264 path is decided once, by the backend: it exists for this run
+  // only if the helper is built and the screen's pixel size could be measured.
+  // Anything else is MJPEG exactly as before — `videoHub` stays null and
+  // `/video` answers 404.
+  const plan = backend.h264;
   for (const note of plan.notes ?? []) console.log(`[h264] ${note}`);
   if (plan.ok) console.log(`[h264] encoder helper found — /video serves H.264 ${plan.width}x${plan.height} @${plan.fps}fps`);
   else console.log(`[h264] off — ${plan.reason}; serving MJPEG only`);
@@ -777,7 +269,7 @@ async function main() {
     : { available: false, reason: plan.reason };
   const videoHub = plan.ok
     ? new H264Hub({
-        spawnPipeline: () => spawnH264Pipeline(sim.udid, plan),
+        spawnPipeline: () => backend.h264Pipeline(),
         info: { width: plan.width, height: plan.height, fps: plan.fps },
         // A viewer with about two seconds of video still unsent is skipped
         // forward to the next keyframe instead of being queued for. (Two, not
@@ -876,7 +368,7 @@ async function main() {
 
   app.get("/stream", authCheck, (req, res) => {
     res.writeHead(200, {
-      "Content-Type": "multipart/x-mixed-replace; boundary=--mjpegstream",
+      "Content-Type": `multipart/x-mixed-replace; boundary=${backend.mjpegBoundary}`,
       "Cache-Control": "no-cache, private, no-store, must-revalidate",
       "Pragma": "no-cache",
       "Connection": "close",
@@ -970,7 +462,7 @@ async function main() {
         return;
       }
       try {
-        const result = await dispatchInput(queue, bounds, evt);
+        const result = await dispatchInput(backend, evt);
         safeSend(ws, { type: "ack", id: evt.id, detail: result?.detail });
       } catch (e) {
         console.error(`[ws] ${evt.type || "?"}: ${e.message}`);
@@ -1066,6 +558,7 @@ async function main() {
     console.log("\n[shutdown] cleaning up...");
     hub.stop();
     videoHub?.stop();
+    backend.stop();
     SHARES?.stop();
     if (REMOTE?.stop) {
       try { await REMOTE.stop(); } catch {}

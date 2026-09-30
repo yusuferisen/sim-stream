@@ -278,3 +278,24 @@ log line — hence tunnel-level `ERR` lines are now echoed; an unauthenticated
 `wss` upgrade reached the `ws` client as `500` though curl sees the `401`
 (browsers get `1006` either way). The `lan` re-check ran from the host only —
 the bench iPhone had locked. `npm test` 99/99 (12 new in `test/remote.test.js`).
+
+## 2026-09-30 — 9.1 (backend seam — the simulator code behind one interface)
+
+Every path that knows the target is a simulator — discovery and boot, `axe`
+resolution, the bounds table, the AXe MJPEG source (HTTP preamble stripped at
+the source, not in the hub), the H.264 pipeline, input → `axe` argv through a
+FIFO, `simctl` screenshots — moved out of `server.js` into
+`backends/simulator.js` behind the backend contract now written in
+`docs/architecture.md` § Backends; `MjpegHub` moved to `mjpeg.js` and became
+source-agnostic with injectable timers, like `H264Hub`. `server.js` keeps auth,
+routes, the sockets, the banner and the screenshot control's destination.
+Behaviour is unchanged, with two deliberate edges: the hub now ignores the exit
+of a source it stopped itself (generation bump, as `H264Hub` does), and a
+missing `axe` fails before the simulator boots. Verified on the run's sandbox
+clone: H.264 and MJPEG surfaces in Chrome, every input event over `/ws` and
+from the page (label match, no-match toast, screenshot toast), reload inside
+the grace window on both hubs (one spawn each), bottom sheet, helper moved
+aside → MJPEG only and `/video` 404. Gotcha: on the clone's first minute
+after boot `axe tap` took ~5 s and the probe screenshot timed out, turning
+H.264 off for that run — a restart fixed it. `npm test` 126/126 (27 new in
+`test/mjpeg.test.js`, `test/queue.test.js`, `test/simulator-backend.test.js`).

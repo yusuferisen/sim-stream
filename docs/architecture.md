@@ -8,15 +8,19 @@
 
 ## Shape
 
-A single-process ESM Node server that translates browser events into AXe CLI
-invocations and pipes AXe's video back out — as MJPEG always, and as H.264
-when the optional encoder helper is built. There is no required build step, no
+A single-process ESM Node server that translates browser events into commands
+against one **backend** — today the iOS Simulator through the AXe CLI — and
+pipes the backend's video back out: as MJPEG always, and as H.264 when the
+optional encoder helper is built. There is no required build step, no
 database, no framework beyond Express + `ws`, and no state that outlives the
 process.
 
 | Module | Responsibility |
 |---|---|
-| `server.js` | Everything server-side: arg parsing, simulator discovery/boot, the auth check sites, HTTP routes, both WebSocket endpoints, the MJPEG hub, spawning the H.264 capture pipeline, the AXe command queue, input translation, shutdown. |
+| `server.js` | The target-agnostic server: arg parsing, the auth check sites, HTTP routes, both WebSocket endpoints, wiring the hubs to the backend, the screenshot control's destination, the banner, shutdown. Spawns nothing but `sips`. |
+| `backends/simulator.js` | The simulator backend (§ Backends): simulator discovery and boot, `axe` resolution, the bounds table, the `axe stream-video` MJPEG source (AXe's HTTP preamble stripped), the H.264 capture pipeline (AXe piped into the helper), input event → `axe` argv, `simctl` screenshots. Import-safe; its pure pieces (`pickSimulator`, `boundsForDeviceType`, `axeInputArgs`, `axeTimeoutMs`, `stripHttpPreamble`) are unit-tested. |
+| `backends/queue.js` | `SerialQueue`: the strict FIFO every backend runs its input commands through. Pure. |
+| `mjpeg.js` | `MjpegHub`: refcount, grace window, generation guard and fan-out for the MJPEG source, source-agnostic. Pure, like `h264.js`: the source and the timers are handed in, so it is unit-testable without a simulator. |
 | `h264.js` | The H.264 path's logic (§ H.264 video path): the capture plan, the helper-record parser, the group-of-pictures cache, and `H264Hub` — refcount, grace window, generation guard and per-viewer delivery. Pure, like `shares.js`: the pipeline, the sockets, the clock and the timers are handed in, so it is unit-testable without a simulator. |
 | `shares.js` | The credential registry (`ShareRegistry`): the owner token plus expiring share tokens, constant-time matching, the definition of expiry, and the tracking that ends long-lived connections when a share dies. Pure — no I/O, no side effects at import, clocks injectable — so it is unit-testable without a simulator. Also exports `parseTtl` / `parseShareSpec`. |
 | `tap-label.js` | Tap by accessibility label: the viewer's text → `axe tap --label=…` / `--id=…` arguments, and AXe's failure output → the one line the error toast shows. Pure; `tapLabelArgs` / `axeErrorLine`. |
@@ -50,19 +54,20 @@ process.
 Independent channels, deliberately not multiplexed:
 
 1. **Video (MJPEG), server → browser.** `GET /stream` responds
-   `multipart/x-mixed-replace; boundary=--mjpegstream` and registers the
-   response with the `MjpegHub`. The hub spawns
-   `axe stream-video --format mjpeg`, strips the leading HTTP headers AXe
-   emits before the first part, and writes every subsequent chunk to all
+   `multipart/x-mixed-replace; boundary=<the backend's>` and registers the
+   response with the `MjpegHub`. The hub opens the backend's MJPEG source —
+   for the simulator, `axe stream-video --format mjpeg` with the leading HTTP
+   headers AXe emits stripped off — and writes every chunk of the body to all
    registered responses. The browser decodes it natively in an `<img>`.
 2. **Video (H.264), server → viewer.** `WS /video`, present only when the
-   encoder helper is built. `H264Hub` spawns `axe stream-video --format bgra`
-   with its stdout handed straight to `sim-stream-encoder`, parses the
-   helper's records, and sends each as one binary message (§ H.264 video
-   path). The page plays it when it can (§ Browser player); scripts use it
+   encoder helper is built. `H264Hub` opens the backend's H.264 pipeline —
+   `axe stream-video --format bgra` with its stdout handed straight to
+   `sim-stream-encoder` — parses the helper's records, and sends each as one
+   binary message (§ H.264 video path). The page plays it when it can (§ Browser player); scripts use it
    too.
 3. **Input, browser → server.** `WS /ws` carries JSON events. Each is parsed,
-   passed to `dispatchInput()`, and acked as `{type:"ack", id}` or
+   handed to the backend's `input()` (the screenshot control to its
+   `screenshot()`), and acked as `{type:"ack", id}` or
    `{type:"error", id, message}`.
 
 Out-of-band on the input WebSocket: a `{type:"hello", simulator, bounds,
@@ -75,27 +80,29 @@ hub's does.
 These are the properties the code maintains; breaking one is a regression even
 if nothing throws.
 
-- **One AXe input command at a time.** `CommandQueue` is a strict FIFO with a
-  `running` flag. Concurrent taps must never reach AXe in parallel — ordering
-  is the whole point.
-- **The capture process is refcounted, with a grace window.** `MjpegHub` spawns
-  on the first client and stops 5 s (`graceMs`) after the last one leaves.
-  Page reloads are a leave-then-join inside that window and must not restart
-  AXe. `H264Hub` keeps the same rule for its own pipeline; the two hubs are
-  independent, so one MJPEG viewer plus one H.264 viewer means two AXe capture
-  processes — accepted, not shared.
-- **Only the current generation may act.** Each spawn bumps `generation`; the
+- **One input command at a time.** Every backend runs its commands through a
+  `SerialQueue` (`backends/queue.js`), a strict FIFO with a `running` flag.
+  Concurrent taps must never reach the target in parallel — ordering is the
+  whole point. Screenshots do not queue (§ Notable asymmetries).
+- **The capture process is refcounted, with a grace window.** `MjpegHub` opens
+  the backend's source for the first client and closes it 5 s (`graceMs`)
+  after the last one leaves. Page reloads are a leave-then-join inside that
+  window and must not restart the capture. `H264Hub` keeps the same rule for
+  its own pipeline; the two hubs are independent, so one MJPEG viewer plus one
+  H.264 viewer means two capture processes — accepted, not shared.
+- **Only the current generation may act.** Each open bumps `generation`; the
   data handler *and* the exit handler each capture it and compare before doing
   anything. Without it, a dying old process tears down its replacement and its
-  trailing stdout bleeds into the new stream. `H264Hub` also bumps it on every
-  deliberate stop and on a death, so the exit of a pipeline it stopped is never
-  mistaken for a failure.
+  trailing output bleeds into the new stream. Both hubs also bump it on every
+  deliberate stop and on a death, so the exit of a source they stopped is
+  never mistaken for a failure; a source that ends on its own — whatever its
+  exit code — is `dead`, which is what makes the page reconnect.
 - **Status is broadcast, never inferred.** `idle | live | dead` transitions
   emit to every WebSocket client, so a viewer that connected while the stream
   was dead learns when it recovers. The client must not derive status from
   page-load state.
 - **Coordinates are normalized on the wire.** The browser sends `(0..1, 0..1)`;
-  only the server knows logical points. `dispatchInput`'s `pt()` clamps to
+  only the backend knows logical points. `axeInputArgs`'s `pt()` clamps to
   `[0,1]` before scaling by `bounds`, so a malformed or out-of-range event
   cannot produce an off-screen coordinate.
 - **The gallery answers only to the owner.** `/gallery` and its file and
@@ -191,6 +198,32 @@ if nothing throws.
 
 Places designed to be extended, and the contract each one implies.
 
+- **Backends** (`backends/`). Everything that knows what is being driven —
+  which target, its bounds, the video source, the H.264 pipeline, input and
+  screenshots — is one object behind this interface; `server.js`, `MjpegHub`
+  and `H264Hub` call nothing else. Auth, shares, tunnels, the player, the
+  gallery and the wire formats are target-agnostic and never change for a new
+  backend. `createSimulatorBackend({udid, mjpeg:{fps,quality,scale},
+  h264:{encoder,fps,scale}, log})` is the one implementation; it is `async`
+  because it boots the simulator and measures its screen.
+
+  | Member | Contract |
+  |---|---|
+  | `kind` | `"simulator"` (a device backend says `"device"`). |
+  | `target` | What `/api/info`'s `simulator` field and the `hello` frame show: `{udid, name, state, runtime, deviceType}`. |
+  | `bounds` | `{w, h}` in logical points, portrait — what normalized coordinates scale by and what the page's aspect ratio comes from. |
+  | `h264` | The capture plan, decided once at creation: `planCapture()`'s result (`ok`, `width`, `height`, `fps`, `scale`, `bitrate`, `notes`) or `{ok: false, reason}`. The server builds `/api/info`'s `h264` and the `H264Hub` from it and never asks again. |
+  | `mjpegBoundary` | The multipart boundary as it appears in the body (AXe: `--mjpegstream`); `/stream`'s `Content-Type` carries it. |
+  | `openMjpeg()` | Returns a **source**: an emitter with `data` (chunks of the bare multipart body — the backend strips any HTTP preamble; the hub parses nothing), `exit` (once, with a detail string) and `kill()`. Throws if it cannot start; the hub reports `dead`. |
+  | `h264Pipeline()` | The same shape, emitting the encoder helper's records (§ H.264 encoder helper, *Output*). Throws when `h264.ok` is false. |
+  | `input(evt)` | Runs one input event (§ Input events) through the backend's `SerialQueue`; resolves to `undefined` or `{detail}` for the ack, rejects with the message the error toast shows. `button: screenshot` is **not** an input — the server routes it to `screenshot()` (the destination and the toast are the server's). |
+  | `screenshot(dest)` | Writes a PNG of the screen to `dest`. Never queued behind input. |
+  | `stop()` | Tears down anything the backend itself owns (the simulator backend owns nothing: capture processes belong to the hubs, commands are one-shot). Called at shutdown after the hubs stop. |
+
+  Log lines the checklist looks for come from the backend through `log`:
+  `[sim] selected:`, `[mjpeg] spawn:`, `[h264] spawn:`. Adding a backend
+  means a second module with this shape and the flag that selects it; the
+  hubs and the routes do not change.
 - **Remote providers** (`remote.js`, the `PROVIDERS` map). **Every hook is
   optional** — the server calls each through optional chaining, so a provider
   implements only what it needs. `lan` has just `prepare` + `start`; the
@@ -234,16 +267,18 @@ Places designed to be extended, and the contract each one implies.
   not handle still leaks the tunnel; nothing in-process can prevent that.
 
   Adding a provider is one map entry; no other file changes.
-- **Simulator selection** (`pickSimulator`). Also hand-maintained: with no
-  `--udid` it takes any already-booted device, otherwise walks a hardcoded
-  preference ladder (iPhone 17 Pro non-Max → any iPhone 17 → any iPhone) and
-  **throws `No iPhone simulator available`** when nothing matches — an
-  iPad-only host cannot start the server at all. Widening platform support
-  starts here, not in the bounds table.
-- **Input events** (`dispatchInput`'s switch). Cases: `tap`, `tap-label`,
-  `long-press`, `swipe`, `type`, `key`, `button`. A coordinate `tap` is sent to
-  AXe with `--tap-style physical` (a touch down/up pair): its default style
-  acks but lands nowhere on iOS 27 simulators.
+- **Simulator selection** (`pickSimulator`, `backends/simulator.js`). Also
+  hand-maintained: with no `--udid` it takes any already-booted device,
+  otherwise walks a hardcoded preference ladder (iPhone 17 Pro non-Max → any
+  iPhone 17 → any iPhone) and **throws `No iPhone simulator available`** when
+  nothing matches — an iPad-only host cannot start the server at all.
+  Widening platform support starts here, not in the bounds table.
+- **Input events** (`axeInputArgs`'s switch, `backends/simulator.js`; the
+  server's `dispatchInput` only peels off the screenshot control). Cases:
+  `tap`, `tap-label`, `long-press`, `swipe`, `type`, `key`, `button`. A
+  coordinate `tap` is sent to AXe with `--tap-style physical` (a touch
+  down/up pair): its default style acks but lands nowhere on iOS 27
+  simulators.
   `tap-label` (`{type:"tap-label", text}`) goes through the same FIFO queue as
   `axe tap --label=<text>`, or `--id=<name>` for a leading `#`, also
   `physical`. AXe does the lookup and refuses no-match and multiple-match
@@ -251,26 +286,28 @@ Places designed to be extended, and the contract each one implies.
   guesses. Values are passed as `--flag=value` so a label starting with `-`
   is not parsed as a flag. The `{type:"error"}` message is AXe's `Error:`
   line minus its generic advice (`axeErrorLine`); the ack's `detail` echoes
-  the target. Its queue timeout is 15 s, not 5 s — the accessibility-tree
-  read can take ~7 s while a screen is mid-transition. `runAxe` rejections
-  carry AXe's raw output as `err.stderr`; a timeout or spawn failure has none. Unknown types throw, which surfaces as a
+  the target. Its queue timeout (`axeTimeoutMs`) is 15 s, not 5 s — the
+  accessibility-tree read can take ~7 s while a screen is mid-transition.
+  `runAxe` rejections carry AXe's raw output as `err.stderr`; a timeout or
+  spawn failure has none. Unknown types throw, which surfaces as a
   `{type:"error"}` ack rather than a silent no-op. Adding an event type means
-  adding a case and a client sender.
-- **Hardware buttons.** Gated by an explicit `allowed` list
-  (`home`, `lock`, `side-button`, `siri`, `apple-pay`, `screenshot`) — not
-  passed through to AXe unvalidated.
-- **Keycodes** (`KEYCODES`). Name → HID code map for the recognized special
-  keys.
-- **Device bounds** (`boundsForDeviceType`). Hand-maintained table mapping a
-  simulator device type to logical points. **A new device model needs a new
-  entry** — a miss here is the single most likely cause of "taps land in the
-  wrong place," and it degrades silently.
+  adding a case (in every backend) and a client sender.
+- **Hardware buttons.** Gated by an explicit list (`BUTTONS`: `home`, `lock`,
+  `side-button`, `siri`, `apple-pay`) — not passed through to AXe
+  unvalidated. `screenshot` is the server's, not the backend's.
+- **Keycodes** (`KEYCODES`, `backends/simulator.js`). Name → HID code map for
+  the recognized special keys.
+- **Device bounds** (`boundsForDeviceType`, `backends/simulator.js`).
+  Hand-maintained table mapping a simulator device type to logical points.
+  **A new device model needs a new entry** — a miss here is the single most
+  likely cause of "taps land in the wrong place," and it degrades silently.
+  Simulator-only: a device backend measures its bounds instead.
 
 ## H.264 encoder helper (`helper/`) — the contract the server builds on
 
 `sim-stream-encoder` is a standalone process with a written contract: the
-server (`spawnH264Pipeline` in `server.js`, the parser in `h264.js`) is built
-on this section, not on the Swift. § H.264 video path is what the server does
+server (the simulator backend's `h264Pipeline()`, the parser in `h264.js`) is
+built on this section, not on the Swift. § H.264 video path is what the server does
 with it.
 
 **Build.** `npm run build:helper` (= `swift build -c release --package-path
@@ -341,7 +378,7 @@ at 1.0; `ffprobe` decodes every frame of the unframed payload.
 
 **Availability is decided once, at startup.** The path exists for a run only
 if the helper binary is present and the simulator's pixel size could be read
-from a screenshot (`planH264`). Otherwise there is no hub, `/video` answers
+from a screenshot (the backend's `h264` plan). Otherwise there is no hub, `/video` answers
 `404` to an authorized upgrade, and MJPEG is the whole video path — one log
 line and the `video:` banner line say which. `/api/info` and the `hello` frame
 carry the outcome:
@@ -361,7 +398,7 @@ that is not a number turns the H.264 path off rather than being guessed at.
 AXe and the helper are always given the same fps and scale — the helper
 derives AXe's frame layout from them.
 
-**The pipeline (`spawnH264Pipeline`).** Two children: AXe, and the helper with
+**The pipeline (the simulator backend's `h264Pipeline()`).** Two children: AXe, and the helper with
 AXe's stdout as its stdin. The descriptor is handed over and the server closes
 its own copy — raw frames never pass through Node (~95 MB/s at the default
 scale), and with no third holder of the pipe a dead helper gives AXe `EPIPE`
@@ -464,10 +501,12 @@ the screen the coordinates describe.
 
 Deliberate, and worth knowing before "fixing" them:
 
-- **Screenshot bypasses the AXe queue.** It's `xcrun simctl io … screenshot`,
-  spawned directly (with a timeout) rather than queued — the queue is reserved
-  for HID input, and a screenshot must not sit behind a swipe. It is still
-  async; never make it `execFileSync`.
+- **Screenshot bypasses the input queue.** `backend.screenshot()` is `xcrun
+  simctl io … screenshot`, spawned directly (with a timeout) rather than
+  queued — the queue is reserved for HID input, and a screenshot must not sit
+  behind a swipe. It is still async; never make it `execFileSync`. The
+  screenshot *control* is also the one input event the server handles
+  itself, because the gallery folder is the server's.
 - **The HTML is templated exactly once.** `__ASPECT__` is replaced with the
   real aspect ratio at startup so the `<img>` reserves correct dimensions
   before `/api/info` returns, avoiding a layout flash. This is the only
@@ -501,8 +540,16 @@ parsing, AXe's frame layout (pinned to measured frame sizes), and the output
 framing. The VideoToolbox path itself is verified by piping a live AXe stream
 through the binary (§ H.264 encoder helper, *Measured*).
 
-**`npm test`** (`node --test`, no dependencies) covers the five modules that
-need no simulator. `shares.js` — TTL and `--share` parsing, token matching,
+**`npm test`** (`node --test`, no dependencies) covers the modules that need
+no simulator. `mjpeg.js` — the MJPEG hub on a fake source, fake responses and
+a hand-cranked timer: refcount and grace window, the generation guard against
+a stopped or dead source's trailing data, what a death does to attached
+clients, an `open()` that throws. `backends/queue.js` — ordering, and that a
+rejected task neither stalls the queue nor leaks. `backends/simulator.js` —
+the selection ladder, the bounds table, every input event's `axe` argv
+(clamping, defaults, the refused names), the per-command timeouts, and the
+HTTP-preamble stripper at every chunk boundary; the process plumbing around
+them is checklist-only. `shares.js` — TTL and `--share` parsing, token matching,
 the expiry boundary, the two-clock and latch rules, session tracking, and the
 expiry timer. Anything that changes how a token is accepted or when it dies
 belongs there first; expiry bugs are silent, and these tests are the only
@@ -576,7 +623,6 @@ phase gate is a browser session:
     `curl -H 'x-token: <owner>' …/gallery/file/..%2F..%2Fx.png` must be `404`
     and an unauthenticated `…/gallery/file/%E0%A4%A.png` a plain-text `400`.
 
-The rest of what *can* be unit-tested without a simulator — `parseArgs`, `pt()`
-clamping, `boundsForDeviceType` — still lives in `server.js`, which runs side
-effects at import. Covering them means
-moving them behind an import-safe module first, as `shares.js` was.
+What remains uncovered in `server.js` — `parseArgs`, the cookie handoff, the
+upgrade handler — runs side effects at import. Covering it means moving it
+behind an import-safe module first, as `shares.js` and `mjpeg.js` were.

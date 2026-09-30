@@ -9,7 +9,7 @@
 
 - **Project:** sim-stream
 - **Target milestone:** Safe public sharing — stop here for review
-- **Status:** `milestone-reached`
+- **Status:** `continue`
 - **Updated:** 2026-09-30
 
 ---
@@ -60,7 +60,7 @@
 - [ ] **Phase 8b — `ngrok` provider (needs the owner's ngrok account)**
   - [ ] 8b.1 `ngrok` provider — same provider shape as 6.1; authtoken from the environment, never a repo file
 - [ ] **Phase 9 — Real-device backend (WebDriverAgent)**
-  - [ ] 9.1 Backend seam — today's AXe/`simctl` code behind one interface in `backends/simulator.js`; behaviour identical, checklist passes on a clone [model: fable]
+  - [x] 9.1 Backend seam → `backends/simulator.js` + `mjpeg.js`; checklist passed on a clone [model: fable]
   - [ ] 9.2 Device video — `--device <udid|role>` opens a WDA session, `ios forward`s its MJPEG server into `MjpegHub`; bounds from `/window/size`; input acks "not supported yet"
   - [ ] 9.3 Device input — tap/long-press/swipe as W3C actions, `type` via `/wda/keys`, buttons via WDA, `tap-label` via accessibility lookup; unlock before dispatch
   - [ ] 9.4 H.264 for devices — helper `--input mjpeg`; `/video` from the device at ≥25 fps and a few Mbit/s
@@ -69,24 +69,30 @@
 
 ## Current Status
 
-- **Current phase / sub-phase:** 9.1 — backend seam (real-device backend, Phase 9)
+- **Current phase / sub-phase:** 9.2 — device video (real-device backend, Phase 9)
 - **State:** not-started
-- **Last completed:** 6.1 (`cloudflared` quick-tunnel provider) — the 🏁 Safe public sharing milestone is reached and awaits the owner's review before its box is ticked
-- **Build:** green (`node --check` ×6) · **Tests:** 99/99 `npm test` + 11 `swift test` · **Simulator-verified:** yes (6.1: sandbox clone through real quick tunnels; QA bench iPhone Safari showed `H.264` and taps landed)
+- **Last completed:** 9.1 (backend seam) — every simulator path now sits behind `backends/simulator.js`; the 🏁 Safe public sharing milestone still awaits the owner's review before its box is ticked
+- **Build:** green (`node --check` ×9) · **Tests:** 126/126 `npm test` + 11 `swift test` · **Simulator-verified:** yes (9.1: full checklist on a sandbox clone — H.264 and MJPEG surfaces, every input path, reload inside the grace window on both hubs, helper-absent → MJPEG only + `/video` 404)
 
 ---
 
 ## Next Concrete Action
 
-> Implement 9.1 (backend seam): create `backends/simulator.js` wrapping
-> `pickSimulator`/boot, `boundsForDeviceType`, the AXe MJPEG spawn, the H.264
-> pipeline plan, `dispatchInput`'s AXe calls and `runScreenshot` behind one
-> interface (`bounds`, `openMjpeg()`, `h264Pipeline()`, `input(evt)`,
-> `screenshot(dest)`, `stop()`); make `server.js`, `MjpegHub` and the H.264 hub
-> call only that interface; write the contract into `docs/architecture.md`.
-> Behaviour must be identical — run the full checklist on a sandbox clone.
+> Implement 9.2 (device video): add `backends/device.js` with the shape in
+> `docs/architecture.md` § Backends — `--device <udid|role>` (+ `--wda <url>`,
+> default `http://localhost:8100`; `primary|secondary|tablet` resolved via
+> `qa-device` when on PATH; mutually exclusive with `--udid`) opens a WDA
+> session, applies `--fps`/`--scale`/`--quality` as WDA MJPEG settings,
+> `ios forward`s device port 9100 to a free host port, fetches that stream
+> and emits its multipart body from `openMjpeg()` (`mjpegBoundary` from the
+> response header); `bounds` from `/window/size`, `target` from `ios info`,
+> `screenshot()` from `/screenshot`, `h264: {ok:false}`, `input()` rejecting
+> "not supported yet", `stop()` killing the forward. Select it in `server.js`
+> by flag. Tests against a fake WDA server (the `fake-cloudflared` pattern).
+> Done when the primary bench iPhone plays in Chrome at ≥25 fps, a share link
+> still expires, and a missing WDA fails at startup with `qa-device up <role>`.
 > Scope: `docs/ROADMAP.md` § Phase 9; defaults: `DECISIONS.md` § Device backend
-> mechanics. 9.1 is tagged `[model: fable]`.
+> mechanics + § Phase 9 pre-flight defaults. 9.2 is untagged.
 > Separately, the owner still owes a review of the 🏁 Safe public sharing
 > milestone (tick its box when satisfied).
 
@@ -94,7 +100,6 @@
 
 ## Open Decisions (reversible — defaults chosen, proceeding)
 
-- **Multi-simulator support** → chose **out of scope; one simulator per server** → DECISIONS.md § Build vs. adopt
 - **Host port for the device's MJPEG forward (9.2)** → chose **a free port picked at startup** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
 - **Device name in the banner and `hello` (9.2)** → chose **`ios info` (`DeviceName`, `ProductType`); WDA's device info only as fallback** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
 - **Special keys and hardware buttons on a device (9.3)** → chose **map what WDA has (return/delete/tab/space; home, lock=side-button, siri), refuse the rest with an error ack** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
@@ -110,22 +115,23 @@
 
 ## Assumptions & Risks
 
-- **Automated tests cover only the import-safe modules** (`npm test`: `shares.js`, the token registry; `h264.js`, the `/video` hub's logic; `gallery.js`, the gallery's serving rules; `tap-label.js`, tap-by-label arguments and error text; `remote.js`'s `cloudflared` provider, against a fake binary). Every other path — including the process plumbing that spawns AXe and the encoder — needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is still the manual checklist in `docs/architecture.md` § Testing strategy.
-- **`boundsForDeviceType()` is a hand-maintained table.** A simulator model missing from it mis-maps taps silently — check `/api/info` bounds first when taps land wrong.
-- **The operator's own token still never expires** within a run, and it is the one on the `local:` / `--remote` banner lines. Only `--share` links die on their own — hand those out, not the top link.
-- **Tailscale providers were not re-run after 5.2 (expiring share links) changed the provider contract** (`start` now returns a token-free URL). `lan` was verified from a real phone and the Tailscale edit is the same one-line shape, but check the printed links on the next `tailscale-serve`/`-funnel` use.
-- **AXe's default tap style does nothing on iOS 27 simulators** (it acks; found in 7.3, the browser player). Coordinate and label taps pass `--tap-style physical` → DECISIONS.md § Browser player mechanics (7.3). An AXe without that flag fails every tap.
-- **`axe button home` showed no effect on iOS 27 sandbox clones during 7.3** — seen from the CLI, not investigated. Check hardware buttons before relying on them.
-- **30 fps is this design's ceiling** — AXe caps `--fps` at 30 → DECISIONS.md § Phase 7 capture source. Measured on one host only.
-- **AXe's raw frame layout is reverse-engineered** (64-byte row padding; row count padded to 16 at scale 1.0 only), measured on one device size (1206×2622). Another model or AXe version could differ — a garbled/sheared H.264 picture means `FrameLayout.axe` needs a new measurement.
-- **Taps take 1.0–2.0 s with the page playing H.264** (7.3, measured in Chrome on a sandbox clone; MJPEG alone: 1.0–1.5 s) against the queue's 5 s timeout. Input wins over smoothness (PRD principle 5): lower the capture rate before loosening the queue.
-- **H.264 in iPhone Safari was checked once** (6.1, the Cloudflare tunnel, QA bench iPhone 16e): header `H.264`, taps land. The MJPEG fallback has still only been seen in Chrome, not on a phone.
-- **The server's H.264 pipeline still has no heartbeat or reconnect limit** — a hung encoder stays `live`. The page copes (falls back after 4 s without frames, never reconnects); a script client must do the same.
-- **Device mode (Phase 9) is bench-only:** WDA must already be running (`qa-device up <role>`), `ios` (go-ios) is required for the port-forward, and the tool cannot tell a bench device from a personal one — the bench rule is the guard. A real device carries real Apple IDs: keep device shares short.
+- **Automated tests cover only the import-safe modules** (`npm test`: `shares.js`, the token registry; `h264.js` and `mjpeg.js`, the two hubs' logic; `gallery.js`, the gallery's serving rules; `tap-label.js`, tap-by-label arguments and error text; `remote.js`'s `cloudflared` provider, against a fake binary; `backends/queue.js` and the pure parts of `backends/simulator.js` — selection, bounds, input → `axe` argv, the preamble stripper). The process plumbing the backend spawns (AXe, `simctl`, the encoder) needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is still the manual checklist in `docs/architecture.md` § Testing strategy.
+- **`boundsForDeviceType()` (in `backends/simulator.js`) is a hand-maintained table.** A simulator model missing from it mis-maps taps silently — check `/api/info` bounds first when taps land wrong.
+- **H.264 can silently turn off on a cold boot.** The startup probe screenshot has a 10 s timeout; a freshly booted clone exceeded it once in 9.1 (the backend seam) and the run said `MJPEG only — … screenshot timed out`. Restart once the simulator settles (a probe retry would fix it; pre-existing, seen once).
+- **The operator's own token never expires** within a run (the `local:` / `--remote` banner links). Hand out `--share` links, not the top one.
+- **Tailscale providers were not re-run after 5.2 (expiring share links) changed the provider contract** — check the printed links on the next `tailscale-serve`/`-funnel` use.
+- **AXe's default tap style does nothing on iOS 27 simulators** — taps pass `--tap-style physical` (7.3, the browser player); an AXe without that flag fails every tap.
+- **`axe button home` has no effect on iOS 27 sandbox clones** (seen in 7.3 and again in 9.1, from the CLI too). Check hardware buttons before relying on them.
+- **30 fps is the simulator ceiling** — AXe caps `--fps` at 30 (DECISIONS.md § Phase 7 capture source).
+- **AXe's raw frame layout is reverse-engineered** on one device size — a sheared H.264 picture on another model or AXe version means `FrameLayout.axe` needs a new measurement (`docs/architecture.md` § H.264 encoder helper).
+- **Taps take 1.0–2.0 s with the page playing H.264** against the queue's 5 s timeout (7.3, the browser player); on a simulator's first minute after boot, ~5 s (9.1). Input wins over smoothness: lower the capture rate before loosening the queue.
+- **H.264 in iPhone Safari was checked once** (6.1, the Cloudflare tunnel); the MJPEG fallback has only been seen in Chrome.
+- **Neither hub has a heartbeat** — a hung capture stays `live`. The page copes (falls back after 4 s without frames); a script client must do the same.
+- **Device mode (Phase 9) is bench-only:** WDA must already be running (`qa-device up <role>`), `ios` (go-ios) is required for the port-forward, and the tool cannot tell a bench device from a personal one — the bench rule is the guard. Keep device shares short.
 - **The QuickTime-mirror capture route is unavailable on this Mac** (macOS 27 / iOS 26.6: no AVFoundation muxed device appears even when enabled), so 60 fps over USB is not on the table; WDA's 29 fps MJPEG is the ceiling for devices.
-- **Phase 8b needs the owner's ngrok account** (`ngrok` not installed; authtoken in the Keychain as `NGROK_AUTHTOKEN`). A run reaching 8b should halt.
-- **Quick tunnels have no uptime guarantee.** One 6.1 run dropped every tunnel connection at once after ~111 s (unexplained; tunnel-level `ERR` lines are now logged as `[remote:cloudflared]`). A share meant to last hours may be better on Tailscale Funnel.
-- **Phase 6b needs a domain on a Cloudflare account** (plus a named tunnel and an Access policy) before it can be built or verified. It sits past the milestone for exactly this reason; a run reaching it should halt.
+- **Phase 8b needs the owner's ngrok account** (authtoken in the Keychain as `NGROK_AUTHTOKEN`). A run reaching it should halt.
+- **Quick tunnels have no uptime guarantee** (one 6.1 run lost every tunnel connection at ~111 s, unexplained). A share meant to last hours may be better on Tailscale Funnel.
+- **Phase 6b needs a domain on a Cloudflare account** (named tunnel + Access policy). A run reaching it should halt.
 
 ---
 

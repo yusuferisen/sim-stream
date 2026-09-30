@@ -6,12 +6,15 @@ input, via the AXe CLI. Single surface at the repo root (no surface folders).
 ## Layout
 
 ```
-server.js            HTTP + WebSocket + MJPEG hub + AXe command queue + auth
+server.js            HTTP + WebSocket + auth — target-agnostic; talks to one backend
+backends/simulator.js  The simulator backend: discovery/boot, bounds, AXe capture + input, simctl screenshots
+backends/queue.js    SerialQueue — the input FIFO every backend runs commands through (pure, unit-tested)
+mjpeg.js             The MJPEG hub — refcount, grace window, generation guard (pure, unit-tested)
 shares.js            Token registry — owner token + expiring --share tokens (pure, unit-tested)
 h264.js              H.264 path logic — record parser, GOP cache, the /video hub (pure, unit-tested)
 tap-label.js         Tap by accessibility label — axe tap args + AXe error → toast line (pure, unit-tested)
 gallery.js           Screenshot gallery rules — names, listing-matched serving, thumbnail cache, page (unit-tested)
-test/                node:test suites for the import-safe modules (shares.js, h264.js, gallery.js, tap-label.js)
+test/                node:test suites for the import-safe modules (shares, h264, mjpeg, gallery, tap-label, remote, queue, simulator backend)
 remote.js            Remote-access providers (prepare/start/stop), --remote <name>
 public/index.html    The entire client — markup, styles, script in one file
 scripts/start.sh     Dev launcher: checks AXe, installs deps, builds the helper, boots the sim
@@ -24,11 +27,12 @@ docs/                PRD · ROADMAP · OVERVIEW · JOURNAL · DECISIONS · archi
 ## Build / run / test contract
 
 There is no required build step. `npm test` covers only the import-safe modules —
-`shares.js` (the token registry), `h264.js` (the H.264 hub's logic),
-`gallery.js` (the screenshot gallery's serving rules) and `tap-label.js`
-(tap-by-label arguments and error text); the
-optional encoder helper has its own `swift test`; everything else is verified
-by hand — see below.
+`shares.js` (the token registry), `h264.js` and `mjpeg.js` (the two hubs'
+logic), `gallery.js` (the screenshot gallery's serving rules), `tap-label.js`
+(tap-by-label arguments and error text), `backends/queue.js` and the pure
+parts of `backends/simulator.js` (selection, bounds, input → `axe` argv); the
+optional encoder helper has its own `swift test`; everything else — every
+process the backend spawns — is verified by hand — see below.
 
 ```sh
 npm install                                  # deps: express, ws
@@ -38,10 +42,10 @@ npm install                                  # deps: express, ws
 ./scripts/start.sh --remote lan              # reachable on the LAN
 ./scripts/start.sh --share demo=2h           # also mint an expiring link
 node server.js --port 9090                   # server directly; same flags
-for f in server.js remote.js shares.js h264.js gallery.js tap-label.js; do node --check $f; done   # syntax gate
+for f in server.js remote.js shares.js h264.js mjpeg.js gallery.js tap-label.js backends/*.js; do node --check $f; done   # syntax gate
 npm run build:helper                         # optional: build helper/ (needs swift)
 (cd helper && swift test)                    # helper's argument/layout/framing tests
-npm test                                     # node --test — shares/h264/gallery/tap-label unit tests, no simulator
+npm test                                     # node --test — the import-safe modules' unit tests, no simulator
 node scripts/video-probe.js --token <T>      # against a running server: 5 s of /video, fps + close code
 ```
 
@@ -53,8 +57,8 @@ tap by label,
 reload to confirm the 5 s grace window doesn't respawn AXe, and narrow the
 viewport below 720 px for the bottom sheet. If you touch `remote.js`, verify
 at least the `lan` provider from a second device. If you touch the H.264 path
-(`h264.js`, the pipeline in `server.js`, `helper/`), run that section's
-`video-probe` step too.
+(`h264.js`, the pipeline in `backends/simulator.js`, `helper/`), run that
+section's `video-probe` step too.
 
 Prerequisites: macOS with Xcode simulators, Node 18+ (ESM),
 `brew install cameroncooke/axe/axe`.
@@ -78,5 +82,8 @@ Prerequisites: macOS with Xcode simulators, Node 18+ (ESM),
   map and nothing else. All three hooks (`prepare` / `start` / `stop`) are
   optional — but a provider that spawns a tunnel process must implement `stop`
   or leak it past exit.
-- A new simulator model needs an entry in `boundsForDeviceType()`; without one,
-  taps mis-map silently.
+- A new simulator model needs an entry in `boundsForDeviceType()`
+  (`backends/simulator.js`); without one, taps mis-map silently.
+- Nothing outside `backends/` spawns `axe` or `simctl`. `server.js`, the hubs
+  and the routes see only the backend interface (`docs/architecture.md`
+  § Backends); a new target is a new module with that shape plus its flag.

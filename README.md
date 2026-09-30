@@ -252,12 +252,13 @@ There are two independent channels between the browser and the server, plus
 a third for scripts:
 
 1. **MJPEG video stream** — `GET /stream` returns `multipart/x-mixed-replace`.
-   The server spawns `axe stream-video --format mjpeg …` and pipes its
-   stdout (after stripping the leading HTTP headers AXe emits) to all
-   connected clients. Browsers natively decode MJPEG inside `<img>` tags.
+   The simulator backend spawns `axe stream-video --format mjpeg …` and the
+   hub pipes its output (after stripping the leading HTTP headers AXe emits)
+   to all connected clients. Browsers natively decode MJPEG inside `<img>`
+   tags.
 
 2. **WebSocket input** — `/ws` carries JSON messages from browser to
-   server for every input event. The server translates them into AXe
+   server for every input event. The backend translates them into AXe
    commands (`tap`, `swipe`, `touch`, `type`, `key`, `button`) serialized
    through a FIFO queue. Acks come back as `{type: "ack", id}`. A
    `{type: "tap-label", text: "Sign In"}` message taps an element by its
@@ -280,14 +281,23 @@ video paths to all WS clients so the status indicator reflects reality, not
 just the initial load.
 
 Coordinates travel as normalized `(0..1, 0..1)` from the browser; the
-server maps them to simulator logical points using bounds it computes once
+backend maps them to simulator logical points using bounds it computes once
 at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
+
+Everything that knows the target is a simulator — discovery, capture, input,
+screenshots — lives in `backends/simulator.js` behind one interface
+(`docs/architecture.md` § Backends); `server.js` is target-agnostic.
 
 ### Key files
 
 | Path                      | Purpose                                                              |
 |---------------------------|----------------------------------------------------------------------|
-| `server.js`               | Node.js server: HTTP, WS, MJPEG hub, AXe command queue, auth         |
+| `server.js`               | Node.js server: HTTP, WS endpoints, auth, wiring the hubs to the backend |
+| `backends/simulator.js`   | The simulator backend: discovery/boot, bounds, AXe capture + input, `simctl` screenshots |
+| `backends/queue.js`       | `SerialQueue`: the input FIFO every backend runs commands through   |
+| `test/simulator-backend.test.js`, `test/queue.test.js` | Unit tests for their pure parts (`npm test`; no simulator needed) |
+| `mjpeg.js`                | The MJPEG hub: refcount, grace window, generation guard, fan-out     |
+| `test/mjpeg.test.js`      | Unit tests for it (`npm test`; no simulator needed)                  |
 | `h264.js`                 | H.264 path logic: record parser, keyframe cache, the `/video` hub    |
 | `test/h264.test.js`       | Unit tests for it (`npm test`; no simulator needed)                  |
 | `scripts/video-probe.js`  | Scripted `/video` client: frame rate, close code, saves the stream   |

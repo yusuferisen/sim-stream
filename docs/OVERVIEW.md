@@ -7,10 +7,12 @@
 > `docs/architecture.md`.
 
 `sim-stream` puts a live, interactive iOS Simulator in a web browser. A Node
-server on the Mac that hosts the simulator spawns the [AXe
+server on the Mac that hosts the simulator drives it through a **backend** —
+today `backends/simulator.js`, which spawns the [AXe
 CLI](https://github.com/cameroncooke/AXe) to capture frames and to inject
-input, and serves both over plain HTTP/WebSocket behind a shareable token link (exchanged
-for an httpOnly cookie on first load). Links minted for other people expire on
+input — and serves both over plain HTTP/WebSocket behind a shareable token link (exchanged
+for an httpOnly cookie on first load). Everything above the backend (auth,
+shares, tunnels, the player, the gallery) is target-agnostic. Links minted for other people expire on
 their own.
 There is no account, no hosted backend, and no required build step — `npm i &&
 node server.js`. An optional Swift helper adds a 30 fps H.264 stream beside the
@@ -34,11 +36,15 @@ flowchart TB
         subgraph srv["server.js (Express + ws)"]
             auth["requestAuthorized<br/>query · x-token · cookie"]
             reg["shares.js — ShareRegistry<br/>owner token + expiring shares<br/>timingSafeEqual · expiry sweep"]
-            hub["MjpegHub<br/>refcounted, 5s grace"]
+            hub["mjpeg.js — MjpegHub<br/>refcounted, 5s grace"]
             vhub["h264.js — H264Hub<br/>refcounted, 5s grace<br/>keyframe on join · slow-viewer skip"]
-            queue["CommandQueue<br/>FIFO, one axe at a time"]
             info["/api/info<br/>simulator · bounds · stream cfg"]
             gal["/gallery — gallery.js<br/>owner only · listing-matched names<br/>sips thumbnails"]
+        end
+        subgraph be["backends/simulator.js — the backend"]
+            src["openMjpeg() · h264Pipeline()"]
+            queue["input() → SerialQueue<br/>FIFO, one axe at a time"]
+            shot["screenshot() · bounds"]
         end
         remote["remote.js<br/>PROVIDERS: lan · tailscale-serve · tailscale-funnel · cloudflared"]
         axe["axe CLI"]
@@ -61,11 +67,14 @@ flowchart TB
     auth -- "owner credential only" --> gal
     gal -- "read ~/Desktop/sim-stream/" --> desk["~/Desktop/sim-stream/<br/>screenshots + .thumbs/"]
     reg -. "on expiry: end that share's /stream, /ws + /video" .-> auth
-    hub -- "spawn axe stream-video --format mjpeg" --> axe
-    vhub -- "spawn axe stream-video --format bgra" --> axe
+    hub -- "open" --> src
+    vhub -- "open" --> src
+    src -- "spawn axe stream-video --format mjpeg / bgra" --> axe
     axe -- "raw frames (fd hand-off)" --> enc
-    enc -- "H.264 records" --> vhub
+    enc -- "H.264 records" --> src
+    src -- "MJPEG body / H.264 records" --> hub
     queue -- "spawn axe tap (x/y or --label/--id)/swipe/touch/type/key/button" --> axe
+    shot -- "xcrun simctl io screenshot" --> sim
     axe --> sim
     sim -- "frames" --> axe
     hub -. "status: idle | live | dead (broadcast to all WS)" .-> ptr
@@ -116,9 +125,9 @@ stateDiagram-v2
 ```
 
 Per-run configuration, resolved once at startup and never mutated: `PORT`,
-`HOST`, `FPS`, `QUALITY`, `SCALE`, the simulator UDID, its logical `bounds`,
-whether the H.264 path exists (helper built, screen size measured) and its
-picture size, and the set of tokens (the registry gains no entries after startup; shares
+`HOST`, `FPS`, `QUALITY`, `SCALE`, the backend (which simulator, its logical
+`bounds`, whether the H.264 path exists — helper built, screen size measured —
+and its picture size), and the set of tokens (the registry gains no entries after startup; shares
 only expire out of it).
 
 ## User stories, as currently implemented
@@ -147,7 +156,7 @@ client uses to size the view before the first frame arrives (no layout flash).
 
 **Drive the UI by touch.** Click or tap to tap; drag to swipe; hold ≥500 ms
 without moving for a long-press. The browser sends normalized `(0..1, 0..1)`
-coordinates; the server maps them to logical points via a per-device-type
+coordinates; the backend maps them to logical points via a per-device-type
 bounds table. Every command is acked back over the WebSocket.
 
 **Type into the app.** Focus the text field in the controls panel and type —
