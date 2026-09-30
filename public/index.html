@@ -293,6 +293,12 @@
         <button id="send-text" class="primary">Send to simulator</button>
       </div>
       <div class="group">
+        <h3>Tap by Label</h3>
+        <div class="hint">Accessibility label, or <kbd>#</kbd> + identifier.</div>
+        <input type="text" id="tap-label" placeholder="e.g. Sign In or #login.submit" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="go" />
+        <button id="tap-label-go" class="primary">Tap</button>
+      </div>
+      <div class="group">
         <h3>Gestures</h3>
         <div class="row">
           <button data-swipe="up">▲ Scroll</button>
@@ -346,7 +352,9 @@
     toastEl.textContent = message;
     toastEl.classList.toggle("bad", kind === "bad");
     toastEl.classList.add("show");
-    toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2500);
+    // Long messages (AXe's tap-by-label errors) stay up long enough to read.
+    const ms = Math.min(8000, Math.max(2500, message.length * 45));
+    toastTimer = setTimeout(() => toastEl.classList.remove("show"), ms);
   }
 
   // -----------------------------------------------------------------------
@@ -782,6 +790,27 @@
   $("send-text").addEventListener("click", () => {
     const t = $("paste-text").value;
     if (t) send({ type: "type", text: t });
+  });
+
+  // Tap by accessibility label. AXe finds the element; a missing or ambiguous
+  // label comes back as AXe's own message in the error toast.
+  const tapLabel = $("tap-label");
+  function sendTapLabel() {
+    const text = tapLabel.value.trim();
+    if (!text) return;
+    if (!wsReady) { toast("Input not connected", "bad"); return; }
+    send({ type: "tap-label", text }, {
+      onAck: (m) => toast(`Tapped ${m.detail || text}`),
+      onError: (m) => toast(m.message, "bad"),
+    });
+    // On a phone, get the sheet (and the soft keyboard) out of the way so the
+    // result is visible — like the Send-text action.
+    tapLabel.blur();
+    autoClose();
+  }
+  $("tap-label-go").addEventListener("click", sendTapLabel);
+  tapLabel.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); sendTapLabel(); }
   });
 
   // Auto-focus the keyboard input for mouse users only. On touch devices

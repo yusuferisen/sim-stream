@@ -65,7 +65,7 @@ flowchart TB
     vhub -- "spawn axe stream-video --format bgra" --> axe
     axe -- "raw frames (fd hand-off)" --> enc
     enc -- "H.264 records" --> vhub
-    queue -- "spawn axe tap/swipe/touch/type/key/button" --> axe
+    queue -- "spawn axe tap (x/y or --label/--id)/swipe/touch/type/key/button" --> axe
     axe --> sim
     sim -- "frames" --> axe
     hub -. "status: idle | live | dead (broadcast to all WS)" .-> ptr
@@ -154,6 +154,12 @@ bounds table. Every command is acked back over the WebSocket.
 keycodes. For longer strings, the "Paste Text" textarea sends the whole string
 in one command rather than keystroke-by-keystroke.
 
+**Tap an element by name.** The "Tap by Label" field takes an accessibility
+label (`Sign In`) or `#` plus an accessibility identifier (`#login.submit`);
+Enter or **Tap** sends it. AXe finds the element and taps it — no pixel
+hunting when checking agent-built UI. A label that matches nothing, or more
+than one element, taps nothing and shows AXe's own message in the error toast.
+
 **Press hardware buttons and send quick gestures.** Home, Lock, and Siri are
 buttons in the panel. The ▲/▼/←/→ controls send preset swipes from the center
 of the screen.
@@ -190,8 +196,8 @@ everything else, it is open).
 
 **Use it on a phone.** At ≤720 px wide the layout goes fullscreen and the
 controls collapse into a bottom sheet behind a corner ⋯ button. Backdrop tap or
-a downward drag on the handle dismisses it. Hardware, gesture, and send-text
-actions close the sheet automatically; keyboard quick-keys deliberately don't,
+a downward drag on the handle dismisses it. Hardware, gesture, send-text and
+tap-by-label actions close the sheet automatically; keyboard quick-keys deliberately don't,
 so they can be chained.
 
 ## What it does not do

@@ -19,6 +19,7 @@ process.
 | `server.js` | Everything server-side: arg parsing, simulator discovery/boot, the auth check sites, HTTP routes, both WebSocket endpoints, the MJPEG hub, spawning the H.264 capture pipeline, the AXe command queue, input translation, shutdown. |
 | `h264.js` | The H.264 path's logic (§ H.264 video path): the capture plan, the helper-record parser, the group-of-pictures cache, and `H264Hub` — refcount, grace window, generation guard and per-viewer delivery. Pure, like `shares.js`: the pipeline, the sockets, the clock and the timers are handed in, so it is unit-testable without a simulator. |
 | `shares.js` | The credential registry (`ShareRegistry`): the owner token plus expiring share tokens, constant-time matching, the definition of expiry, and the tracking that ends long-lived connections when a share dies. Pure — no I/O, no side effects at import, clocks injectable — so it is unit-testable without a simulator. Also exports `parseTtl` / `parseShareSpec`. |
+| `tap-label.js` | Tap by accessibility label: the viewer's text → `axe tap --label=…` / `--id=…` arguments, and AXe's failure output → the one line the error toast shows. Pure; `tapLabelArgs` / `axeErrorLine`. |
 | `gallery.js` | The screenshot gallery's rules (§ Screenshot gallery): the folder and file names, which names may be served (matched against the directory listing), the `sips` thumbnail cache, and the `/gallery` page. Import-safe; `sips` is handed in. |
 | `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`. Knows nothing about streaming or input. |
 | `public/index.html` | The entire client — markup, styles, and script in one file: the H.264 player (WebCodecs → `<canvas>`), the MJPEG `<img>` it falls back to, the input layer. Served with one templated substitution. |
@@ -214,10 +215,20 @@ Places designed to be extended, and the contract each one implies.
   **throws `No iPhone simulator available`** when nothing matches — an
   iPad-only host cannot start the server at all. Widening platform support
   starts here, not in the bounds table.
-- **Input events** (`dispatchInput`'s switch). Cases: `tap`, `long-press`,
-  `swipe`, `type`, `key`, `button`. A coordinate `tap` is sent to AXe with
-  `--tap-style physical` (a touch down/up pair): its default style acks but
-  lands nowhere on iOS 27 simulators. Unknown types throw, which surfaces as a
+- **Input events** (`dispatchInput`'s switch). Cases: `tap`, `tap-label`,
+  `long-press`, `swipe`, `type`, `key`, `button`. A coordinate `tap` is sent to
+  AXe with `--tap-style physical` (a touch down/up pair): its default style
+  acks but lands nowhere on iOS 27 simulators.
+  `tap-label` (`{type:"tap-label", text}`) goes through the same FIFO queue as
+  `axe tap --label=<text>`, or `--id=<name>` for a leading `#`, also
+  `physical`. AXe does the lookup and refuses no-match and multiple-match
+  itself; the server never resolves a label to coordinates, so it never
+  guesses. Values are passed as `--flag=value` so a label starting with `-`
+  is not parsed as a flag. The `{type:"error"}` message is AXe's `Error:`
+  line minus its generic advice (`axeErrorLine`); the ack's `detail` echoes
+  the target. Its queue timeout is 15 s, not 5 s — the accessibility-tree
+  read can take ~7 s while a screen is mid-transition. `runAxe` rejections
+  carry AXe's raw output as `err.stderr`; a timeout or spawn failure has none. Unknown types throw, which surfaces as a
   `{type:"error"}` ack rather than a silent no-op. Adding an event type means
   adding a case and a client sender.
 - **Hardware buttons.** Gated by an explicit `allowed` list
@@ -463,7 +474,7 @@ parsing, AXe's frame layout (pinned to measured frame sizes), and the output
 framing. The VideoToolbox path itself is verified by piping a live AXe stream
 through the binary (§ H.264 encoder helper, *Measured*).
 
-**`npm test`** (`node --test`, no dependencies) covers the three modules that
+**`npm test`** (`node --test`, no dependencies) covers the four modules that
 need no simulator. `shares.js` — TTL and `--share` parsing, token matching,
 the expiry boundary, the two-clock and latch rules, session tracking, and the
 expiry timer. Anything that changes how a token is accepted or when it dies
@@ -479,7 +490,9 @@ excluded), what a requested name may resolve to (traversal, encoded
 separators, the thumbnail folder), the thumbnail cache (reuse, staleness,
 one generation for concurrent requests, clean failure) and the page's
 escaping. Serving rules fail open silently, so a change to them belongs there
-first.
+first. `tap-label.js` — `#` → `--id`, trimming, dash-leading labels kept as
+one `--flag=value` argument, empty/over-long input, and AXe's real no-match
+and multiple-match output reduced to the toast line.
 
 Everything else has **no automated coverage**, and the reason is structural:
 every other meaningful path requires a booted iOS Simulator plus the AXe binary
@@ -492,7 +505,8 @@ phase gate is a browser session:
    The address bar must show the URL **without** `token` (cookie handoff), and
    `curl -i` on the printed link must answer `302` with an `HttpOnly` cookie.
 3. Exercise each input path — tap, drag-swipe, long-press, typed text, a
-   special key, a hardware button, a screenshot.
+   special key, a hardware button, a screenshot, a tap by label (one that
+   matches, and one that doesn't — AXe's message in the error toast).
 4. Reload the page — confirm the AXe process is *not* restarted (grace window)
    and status recovers.
 5. Narrow the viewport below 720 px — confirm the bottom sheet behaves.

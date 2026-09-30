@@ -1,7 +1,8 @@
 # sim-stream
 
 Stream an iOS Simulator running on your Mac to any web browser, with
-interactive input (tap, swipe, long-press, keyboard, hardware buttons).
+interactive input (tap, swipe, long-press, tap by accessibility label,
+keyboard, hardware buttons).
 
 Built for one use case: you run the simulator on a Mac (e.g. a Mac Mini at
 your desk), and you want to test iOS apps remotely from a laptop, phone, or
@@ -182,6 +183,11 @@ map and it becomes selectable as `--remote <name>`. No other code changes.
   `Enter`, `Backspace`, `Tab`, `Esc`, arrows are recognized.
 - **Paste text** — use the "Paste Text" textarea to send long strings
   without keystroke-by-keystroke lag
+- **Tap by label** — type an accessibility label (`Sign In`) or `#` plus an
+  accessibility identifier (`#login.submit`) and press Enter or **Tap**.
+  AXe finds the element; if nothing matches, or several elements do, nothing
+  is tapped and AXe's message appears in the error toast. Handy for
+  checking UI without hunting for pixel positions
 - **Hardware buttons** — Home, Lock, Siri
 - **Quick swipes** — the ▲/▼/←/→ buttons send preset swipes from the
   center of the screen
@@ -195,8 +201,8 @@ map and it becomes selectable as `--remote <name>`. No other code changes.
 
 On narrow viewports (≤720px wide), the controls panel collapses into a
 bottom sheet opened by a corner ⋯ button. Tap a backdrop or drag the
-handle down to dismiss; Hardware/Gesture/Send-text actions auto-close the
-sheet, keyboard quick-keys (Return/Back/Space/Tab) do not, so they can be
+handle down to dismiss; Hardware/Gesture/Send-text/Tap-by-label actions
+auto-close the sheet, keyboard quick-keys (Return/Back/Space/Tab) do not, so they can be
 chained.
 
 ## Configuration flags
@@ -236,7 +242,10 @@ a third for scripts:
 2. **WebSocket input** — `/ws` carries JSON messages from browser to
    server for every input event. The server translates them into AXe
    commands (`tap`, `swipe`, `touch`, `type`, `key`, `button`) serialized
-   through a FIFO queue. Acks come back as `{type: "ack", id}`.
+   through a FIFO queue. Acks come back as `{type: "ack", id}`. A
+   `{type: "tap-label", text: "Sign In"}` message taps an element by its
+   accessibility label (`"#login.submit"`: by identifier) — AXe finds it;
+   no match or several matches come back as `{type: "error", message}`.
 
 3. **H.264 video stream (optional)** — `/video` is a WebSocket that sends
    30 fps H.264, one frame per binary message, when the encoder helper is
@@ -266,6 +275,8 @@ at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
 | `test/h264.test.js`       | Unit tests for it (`npm test`; no simulator needed)                  |
 | `scripts/video-probe.js`  | Scripted `/video` client: frame rate, close code, saves the stream   |
 | `shares.js`               | The token registry: your token plus expiring share tokens            |
+| `tap-label.js`            | Tap by accessibility label: `axe tap` arguments, AXe's error → one line |
+| `test/tap-label.test.js`  | Unit tests for it (`npm test`; no simulator needed)                  |
 | `gallery.js`              | Screenshot gallery: file names, which files may be served, thumbnails, the page |
 | `test/gallery.test.js`    | Unit tests for it (`npm test`; no simulator needed)                  |
 | `test/shares.test.js`     | Unit tests for the registry (`npm test`; no simulator needed)        |

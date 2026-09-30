@@ -28,6 +28,7 @@ import { getRemoteProvider } from "./remote.js";
 import { ShareRegistry, mintToken, parseShareSpec } from "./shares.js";
 import { H264Hub, parsePngSize, planCapture } from "./h264.js";
 import { ThumbCache, galleryDir, listScreenshots, renderGalleryPage, resolveScreenshot, screenshotName, sipsArgs } from "./gallery.js";
+import { axeErrorLine, tapLabelArgs } from "./tap-label.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -580,10 +581,14 @@ class CommandQueue {
     return new Promise((resolve, reject) => {
       const full = [...argv, "--udid", this.udid];
       // `axe type` sends one HID event per char; long strings take real time.
+      // A tap by label or id first reads the accessibility tree, which can
+      // take several seconds while the screen is mid-transition (7 s seen).
       // Other commands (tap, swipe, button, key) are fast; 5s is plenty.
       const timeoutMs = argv[0] === "type"
         ? Math.max(10_000, (argv[1]?.length || 0) * 80)
-        : 5000;
+        : argv[0] === "tap" && /^--(label|id)=/.test(argv[1] ?? "")
+          ? 15_000
+          : 5000;
       const proc = spawn(AXE, full, { stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "", stderr = "";
       proc.stdout.on("data", (d) => (stdout += d.toString()));
@@ -595,7 +600,7 @@ class CommandQueue {
       proc.on("exit", (code) => {
         clearTimeout(timer);
         if (code === 0) resolve(stdout);
-        else reject(new Error(`axe ${argv.join(" ")} exit=${code} ${stderr.trim()}`));
+        else reject(Object.assign(new Error(`axe ${argv.join(" ")} exit=${code} ${stderr.trim()}`), { stderr }));
       });
       proc.on("error", (e) => {
         clearTimeout(timer);
@@ -633,6 +638,19 @@ async function dispatchInput(queue, bounds, evt) {
       // (FBSimulator tapAt) acks but lands nowhere on iOS 27 simulators.
       await queue.push(["tap", "-x", String(p.x), "-y", String(p.y), "--tap-style", "physical"]);
       return;
+    }
+    case "tap-label": {
+      const argv = tapLabelArgs(evt.text);
+      try {
+        await queue.push(argv);
+      } catch (e) {
+        // AXe's own words ("No accessibility element matched --label 'X'.")
+        // are the viewer's error toast; the full output stays in the log.
+        if (e.stderr === undefined) throw e;
+        console.error(`[ws] ${e.message}`);
+        throw new Error(axeErrorLine(e.stderr) || e.message);
+      }
+      return { detail: evt.text.trim() }; // tapLabelArgs() proved it a string
     }
     case "long-press": {
       const p = pt(evt.x, evt.y);

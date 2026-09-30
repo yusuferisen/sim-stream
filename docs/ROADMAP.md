@@ -84,39 +84,6 @@ else. If LAN smoothness turns out to matter, add it as a lettered phase.
 
 ---
 
-## Phase 8 — Borrowed conveniences
-
-Small, independent, additive. None of them changes the architecture; each can
-land alone.
-
-- **8.1 — Screenshot gallery.** Screenshots currently drop into
-  `~/Desktop/sim-stream-<timestamp>.png` and are immediately hard to find. New
-  ones land in `~/Desktop/sim-stream/`, and an authenticated `/gallery` page
-  shows a newest-first thumbnail grid linking to the full images. Thumbnails
-  come from macOS's built-in `sips`, cached beside the originals — no image
-  library. The gallery answers only to the owner credential: a share link is
-  for driving the simulator, not for browsing what was captured before it was
-  issued. With `--auth false` there is no owner credential and the gallery is
-  open, like every other route. File serving takes a bare filename matched against the directory
-  listing, never a path. Read-only — no delete or rename endpoint. The listing
-  and filename rules live in an import-safe module with `node:test` coverage.
-  SimCast's `pending → ready/failed` persistence lifecycle is overkill here —
-  stay on the filesystem.
-- **8.2 — Tap by accessibility label.** AXe (1.8.0 on this host) resolves
-  labels itself: `axe tap --label`. So this is a new `tap-label` input event
-  that goes through the same FIFO command queue as every other input, plus a
-  text field in the controls panel. A leading `#` targets an accessibility
-  identifier (`--id`) instead. When a label is missing or matches more than
-  one element, AXe says so; that message reaches the viewer as the normal
-  error toast — the server never guesses which element was meant. Directly
-  useful for verifying agent-built UI without hunting for pixel positions.
-
-**Open question carried from the evaluation.** If the gallery ever wants to
-sync across devices it reproduces exactly the persistence problem that made
-SimCast unattractive. Keep it local.
-
----
-
 ## Phase 8b — `ngrok` provider
 
 **Parked behind an owner prerequisite, deliberately** — see `DECISIONS.md §

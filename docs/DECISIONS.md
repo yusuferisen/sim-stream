@@ -596,3 +596,30 @@ Choices made while building `/gallery`; all reversible.
   `/gallery/file/%E0%A4%A.png` got Express's development error page with a
   stack trace and server paths. *Rejected:* `NODE_ENV=production` — it would
   depend on how the server is started.
+- **The gallery stays on the local filesystem** (carried from the SimCast
+  evaluation, § Build vs. adopt). Syncing it across devices would reproduce
+  exactly the persistence lifecycle that made SimCast unattractive.
+
+---
+
+## 2026-09-30 — Tap-by-label mechanics (8.2)
+
+Choices made while building the `tap-label` input event; all reversible.
+
+- **Arguments go as `--label=<text>` / `--id=<name>`**, not two argv entries:
+  AXe's parser reads a separate value that starts with `-` as another flag
+  (`--label -x` → "Missing value"). Measured on AXe 1.8.0.
+- **The toast shows AXe's `Error:` line minus its generic advice** ("Make sure
+  the app is on the expected screen, then run `axe describe-ui` …"). The full
+  output stays in the server log. Cut at that phrase, not at the first full
+  stop, so a label like `Mr. Smith` survives; unknown output is shown whole.
+- **A 15 s queue timeout for label/id taps**, 5 s for everything else. A miss
+  normally answers in under 1 s, but one took 7 s during a screen transition,
+  and a timeout would replace AXe's message with "timed out". A slow lookup
+  holds the FIFO queue for that long — accepted, since it is the viewer's own
+  deliberate action. *Rejected:* `--wait-timeout` polling — it would hold the
+  queue by design.
+- **A leading `#` always means an identifier.** No escape for a label that
+  itself starts with `#`; use a coordinate tap for that rare case.
+- **Error toasts stay up in proportion to their length** (45 ms per
+  character, 2.5–8 s) — AXe's multiple-match message is ~190 characters.

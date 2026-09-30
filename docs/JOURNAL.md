@@ -246,3 +246,17 @@ malformed `%`-escape made Express answer anyone with its stack-trace error page;
 a final plain-text error handler closes it. Verified on the run's sandbox clone
 with curl and Chrome (owner grid with thumbnails, share page without the link and
 `403`, traversal `404`s). `npm test` 77/77 (18 new in `test/gallery.test.js`).
+
+## 2026-09-30 — 8.2 (tap by accessibility label)
+
+A "Tap by Label" field in the controls panel sends a new `tap-label` input
+event; the server queues `axe tap --label=<text>` (or `--id=<name>` for a leading
+`#`) with `--tap-style physical` through the same FIFO queue as every other
+input. AXe resolves the element and refuses no-match and multiple-match itself;
+the viewer sees AXe's own sentence in the error toast. The rules live in the new
+import-safe `tap-label.js`. Gotchas: a separate argv value starting with `-`
+breaks AXe's parser (hence `--flag=value`), and a lookup took 7 s once during a
+screen transition (hence a 15 s timeout for label taps). Verified on the run's
+sandbox clone — over `/ws` (match, no match, several matches, `#id` miss, blank,
+`-x`) and in Chrome (Settings → General → About by label; error toast).
+`npm test` 87/87 (10 new in `test/tap-label.test.js`).
