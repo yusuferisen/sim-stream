@@ -61,7 +61,7 @@
   - [ ] 8b.1 `ngrok` provider — same provider shape as 6.1; authtoken from the environment, never a repo file
 - [ ] **Phase 9 — Real-device backend (WebDriverAgent)**
   - [x] 9.1 Backend seam → `backends/simulator.js` + `mjpeg.js`; checklist passed on a clone [model: fable]
-  - [ ] 9.2 Device video — `--device <udid|role>` opens a WDA session, `ios forward`s its MJPEG server into `MjpegHub`; bounds from `/window/size`; input acks "not supported yet"
+  - [x] 9.2 Device video → `backends/device.js`; ~28 fps from the primary bench iPhone
   - [ ] 9.3 Device input — tap/long-press/swipe as W3C actions, `type` via `/wda/keys`, buttons via WDA, `tap-label` via accessibility lookup; unlock before dispatch
   - [ ] 9.4 H.264 for devices — helper `--input mjpeg`; `/video` from the device at ≥25 fps and a few Mbit/s
 
@@ -69,30 +69,29 @@
 
 ## Current Status
 
-- **Current phase / sub-phase:** 9.2 — device video (real-device backend, Phase 9)
+- **Current phase / sub-phase:** 9.3 — device input (real-device backend, Phase 9)
 - **State:** not-started
-- **Last completed:** 9.1 (backend seam) — every simulator path now sits behind `backends/simulator.js`; the 🏁 Safe public sharing milestone still awaits the owner's review before its box is ticked
-- **Build:** green (`node --check` ×9) · **Tests:** 126/126 `npm test` + 11 `swift test` · **Simulator-verified:** yes (9.1: full checklist on a sandbox clone — H.264 and MJPEG surfaces, every input path, reload inside the grace window on both hubs, helper-absent → MJPEG only + `/video` 404)
+- **Last completed:** 9.2 (device video) — `--device primary` streams the bench iPhone 16e to Chrome at 27–28 fps, view-only; the 🏁 Safe public sharing milestone still awaits the owner's review before its box is ticked
+- **Build:** green (`node --check` ×10) · **Tests:** 140/140 `npm test` + 11 `swift test` · **Device-verified:** yes (9.2: primary bench iPhone — Chrome playback, reload in the grace window, input error ack, screenshot, a 40 s share expiring, no forward left after Ctrl-C, dead WDA → startup exit with `qa-device up primary`)
 
 ---
 
 ## Next Concrete Action
 
-> Implement 9.2 (device video): add `backends/device.js` with the shape in
-> `docs/architecture.md` § Backends — `--device <udid|role>` (+ `--wda <url>`,
-> default `http://localhost:8100`; `primary|secondary|tablet` resolved via
-> `qa-device` when on PATH; mutually exclusive with `--udid`) opens a WDA
-> session, applies `--fps`/`--scale`/`--quality` as WDA MJPEG settings,
-> `ios forward`s device port 9100 to a free host port, fetches that stream
-> and emits its multipart body from `openMjpeg()` (`mjpegBoundary` from the
-> response header); `bounds` from `/window/size`, `target` from `ios info`,
-> `screenshot()` from `/screenshot`, `h264: {ok:false}`, `input()` rejecting
-> "not supported yet", `stop()` killing the forward. Select it in `server.js`
-> by flag. Tests against a fake WDA server (the `fake-cloudflared` pattern).
-> Done when the primary bench iPhone plays in Chrome at ≥25 fps, a share link
-> still expires, and a missing WDA fails at startup with `qa-device up <role>`.
-> Scope: `docs/ROADMAP.md` § Phase 9; defaults: `DECISIONS.md` § Device backend
-> mechanics + § Phase 9 pre-flight defaults. 9.2 is untagged.
+> Implement 9.3 (device input) in `backends/device.js`: replace the
+> "not supported yet" `input()` with a `SerialQueue` that maps tap /
+> long-press / swipe to W3C pointer actions (`POST /session/:id/actions`,
+> points = normalized × `bounds`, clamped like `axeInputArgs`), `type` via
+> `/wda/keys`, keys and buttons per `DECISIONS.md` § Phase 9 pre-flight
+> defaults (refuse the rest with an error ack), and `tap-label` via an
+> accessibility lookup (`/elements` by label, `#id` by identifier; no match /
+> several matches → error ack). Before each command check `/wda/locked` and
+> wake: `/wda/unlock` timed out on the locked 16e in 9.2 while
+> `/wda/homescreen` unlocked it. Use `WdaClient.session()` (one-retry
+> recovery). Tests against the fake WDA in `test/device-backend.test.js`.
+> Done when the browser checklist (tap, swipe, long-press, typed text, a key,
+> a button, a label tap, a screenshot) passes from Chrome on the primary bench
+> iPhone. Scope: `docs/ROADMAP.md` § Phase 9. 9.3 is untagged.
 > Separately, the owner still owes a review of the 🏁 Safe public sharing
 > milestone (tick its box when satisfied).
 
@@ -100,8 +99,7 @@
 
 ## Open Decisions (reversible — defaults chosen, proceeding)
 
-- **Host port for the device's MJPEG forward (9.2)** → chose **a free port picked at startup** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
-- **Device name in the banner and `hello` (9.2)** → chose **`ios info` (`DeviceName`, `ProductType`); WDA's device info only as fallback** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
+- **Device MJPEG default rate, forward proof, no forward respawn (9.2)** → chose **30 fps; prove WDA's MJPEG answers before listening; a dead forward means restart** → DECISIONS.md § Device video mechanics (phase 9)
 - **Special keys and hardware buttons on a device (9.3)** → chose **map what WDA has (return/delete/tab/space; home, lock=side-button, siri), refuse the rest with an error ack** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
 - **Helper JPEG input (9.4)** → chose **ImageIO decode, frames found by SOI/EOI scan, size from the first SOF; the server fetches the MJPEG and pipes it to the helper's stdin** → DECISIONS.md § Phase 9 pre-flight defaults (phase 9)
 
@@ -115,7 +113,7 @@
 
 ## Assumptions & Risks
 
-- **Automated tests cover only the import-safe modules** (`npm test`: `shares.js`, the token registry; `h264.js` and `mjpeg.js`, the two hubs' logic; `gallery.js`, the gallery's serving rules; `tap-label.js`, tap-by-label arguments and error text; `remote.js`'s `cloudflared` provider, against a fake binary; `backends/queue.js` and the pure parts of `backends/simulator.js` — selection, bounds, input → `axe` argv, the preamble stripper). The process plumbing the backend spawns (AXe, `simctl`, the encoder) needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is still the manual checklist in `docs/architecture.md` § Testing strategy.
+- **Automated tests cover only the import-safe modules** (`npm test`: `shares.js`, the token registry; `h264.js` and `mjpeg.js`, the two hubs' logic; `gallery.js`, the gallery's serving rules; `tap-label.js`, tap-by-label arguments and error text; `remote.js`'s `cloudflared` provider, against a fake binary; `backends/queue.js` and the pure parts of `backends/simulator.js` — selection, bounds, input → `axe` argv, the preamble stripper; `backends/device.js` against a fake WDA and a fake `ios`). The process plumbing the backend spawns (AXe, `simctl`, the encoder) needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is still the manual checklist in `docs/architecture.md` § Testing strategy.
 - **`boundsForDeviceType()` (in `backends/simulator.js`) is a hand-maintained table.** A simulator model missing from it mis-maps taps silently — check `/api/info` bounds first when taps land wrong.
 - **H.264 can silently turn off on a cold boot.** The startup probe screenshot has a 10 s timeout; a freshly booted clone exceeded it once in 9.1 (the backend seam) and the run said `MJPEG only — … screenshot timed out`. Restart once the simulator settles (a probe retry would fix it; pre-existing, seen once).
 - **The operator's own token never expires** within a run (the `local:` / `--remote` banner links). Hand out `--share` links, not the top one.
@@ -127,6 +125,7 @@
 - **Taps take 1.0–2.0 s with the page playing H.264** against the queue's 5 s timeout (7.3, the browser player); on a simulator's first minute after boot, ~5 s (9.1). Input wins over smoothness: lower the capture rate before loosening the queue.
 - **H.264 in iPhone Safari was checked once** (6.1, the Cloudflare tunnel); the MJPEG fallback has only been seen in Chrome.
 - **Neither hub has a heartbeat** — a hung capture stays `live`. The page copes (falls back after 4 s without frames); a script client must do the same.
+- **go-ios binds the device's MJPEG forward on all interfaces** (no bind-address option) — anyone on the LAN who finds the port sees the device's screen without a token while a device server runs, as the bench's WDA forwards already allow full control. Keep device runs on trusted networks.
 - **Device mode (Phase 9) is bench-only:** WDA must already be running (`qa-device up <role>`), `ios` (go-ios) is required for the port-forward, and the tool cannot tell a bench device from a personal one — the bench rule is the guard. Keep device shares short.
 - **The QuickTime-mirror capture route is unavailable on this Mac** (macOS 27 / iOS 26.6: no AVFoundation muxed device appears even when enabled), so 60 fps over USB is not on the table; WDA's 29 fps MJPEG is the ceiling for devices.
 - **Phase 8b needs the owner's ngrok account** (authtoken in the Keychain as `NGROK_AUTHTOKEN`). A run reaching it should halt.

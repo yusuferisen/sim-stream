@@ -9,8 +9,9 @@
 //   - WS /ws       — JSON input events (tap/swipe/type/button/key), handed to
 //     the backend, which runs them one at a time.
 //
-// Everything that knows what is being driven — today an iOS Simulator through
-// the AXe CLI (backends/simulator.js) — sits behind the backend interface in
+// Everything that knows what is being driven — an iOS Simulator through the
+// AXe CLI (backends/simulator.js), or with `--device` a real bench device
+// through WebDriverAgent (backends/device.js) — sits behind the backend interface in
 // docs/architecture.md § Backends. This file is target-agnostic: auth, routes,
 // the WebSocket endpoints, the banner and shutdown.
 //
@@ -34,6 +35,7 @@ import { H264Hub } from "./h264.js";
 import { MjpegHub } from "./mjpeg.js";
 import { ThumbCache, galleryDir, listScreenshots, renderGalleryPage, resolveScreenshot, screenshotName, sipsArgs } from "./gallery.js";
 import { createSimulatorBackend } from "./backends/simulator.js";
+import { createDeviceBackend } from "./backends/device.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -41,7 +43,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Keeping this explicit means `--token --port 9090` fails loudly instead of
 // silently treating `token` as a boolean and eating the next flag.
 const VALUE_FLAGS = new Set([
-  "port", "host", "fps", "quality", "scale", "udid", "token", "auth", "remote", "share",
+  "port", "host", "fps", "quality", "scale", "udid", "device", "wda", "token", "auth", "remote", "share",
 ]);
 // Value flags that may be given more than once; these parse to an array.
 const REPEATABLE_FLAGS = new Set(["share"]);
@@ -68,10 +70,23 @@ function parseArgs(argv) {
 }
 
 const args = parseArgs(process.argv.slice(2));
+// One target per process: a simulator (the default, or `--udid`) or a real
+// device (`--device <udid|role>`, with `--wda <url>`).
+const DEVICE_MODE = args.device !== undefined;
+if (DEVICE_MODE && args.udid !== undefined) {
+  console.error("[args] --device and --udid are mutually exclusive — one target per process");
+  process.exit(1);
+}
+if (!DEVICE_MODE && args.wda !== undefined) {
+  console.error("[args] --wda only applies with --device");
+  process.exit(1);
+}
 const PORT = parseInt(args.port || process.env.PORT || "8080", 10);
 const HOST_EXPLICIT = args.host !== undefined || process.env.HOST !== undefined;
 const HOST = args.host || process.env.HOST || "127.0.0.1";
-const FPS = parseInt(args.fps || "15", 10);
+// MJPEG's rate: 15 by default for a simulator (already more than AXe's MJPEG
+// mode delivers); 30 for a device, whose WDA MJPEG server keeps up with it.
+const FPS = parseInt(args.fps || (DEVICE_MODE ? "30" : "15"), 10);
 const QUALITY = parseInt(args.quality || "75", 10);
 const SCALE = parseFloat(args.scale || "0.5");
 // The H.264 path captures at 30 fps unless --fps says otherwise. (MJPEG's
@@ -237,15 +252,29 @@ async function dispatchInput(backend, evt) {
 }
 
 async function main() {
-  // Everything that knows the target is a simulator lives behind the backend
+  // Everything that knows what the target is lives behind the backend
   // (docs/architecture.md § Backends): which one, its bounds, the MJPEG source,
   // the H.264 pipeline, input and screenshots.
-  const backend = await createSimulatorBackend({
-    udid: args.udid || null,
-    mjpeg: { fps: FPS, quality: QUALITY, scale: SCALE },
-    h264: { encoder: ENCODER, fps: H264_FPS, scale: SCALE },
-    log: (line) => console.log(line),
-  });
+  const log = (line) => console.log(line);
+  let backend;
+  try {
+    backend = DEVICE_MODE
+      ? await createDeviceBackend({
+          device: args.device,
+          wda: args.wda || null,
+          mjpeg: { fps: FPS, quality: QUALITY, scale: SCALE },
+          log,
+        })
+      : await createSimulatorBackend({
+          udid: args.udid || null,
+          mjpeg: { fps: FPS, quality: QUALITY, scale: SCALE },
+          h264: { encoder: ENCODER, fps: H264_FPS, scale: SCALE },
+          log,
+        });
+  } catch (e) {
+    console.error(`[${DEVICE_MODE ? "device" : "sim"}] ${e.message}`);
+    process.exit(1);
+  }
   const sim = backend.target;
   const { bounds } = backend;
 
@@ -544,7 +573,7 @@ async function main() {
       console.log(`[auth] share "${entry.label}" expired — closed ${closed} open connection${closed === 1 ? "" : "s"}`);
     });
   }
-  console.log(`  simulator: ${sim.name} (${sim.udid})`);
+  console.log(`  ${backend.kind === "device" ? "device:   " : "simulator:"} ${sim.name} (${sim.udid})`);
   console.log(`  stream:    ${FPS}fps scale=${SCALE} quality=${QUALITY}`);
   console.log(plan.ok
     ? `  video:     H.264 ${plan.width}x${plan.height} @${plan.fps}fps on /video (MJPEG on /stream)`

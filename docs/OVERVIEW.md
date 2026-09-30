@@ -6,11 +6,12 @@
 > `docs/ROADMAP.md`, history in `docs/JOURNAL.md`, the engineering contract in
 > `docs/architecture.md`.
 
-`sim-stream` puts a live, interactive iOS Simulator in a web browser. A Node
-server on the Mac that hosts the simulator drives it through a **backend** —
-today `backends/simulator.js`, which spawns the [AXe
-CLI](https://github.com/cameroncooke/AXe) to capture frames and to inject
-input — and serves both over plain HTTP/WebSocket behind a shareable token link (exchanged
+`sim-stream` puts a live, interactive iOS Simulator — or, with `--device`, a
+real QA-bench iPhone or iPad — in a web browser. A Node server on the Mac
+drives the target through a **backend** — `backends/simulator.js`, which
+spawns the [AXe CLI](https://github.com/cameroncooke/AXe) to capture frames
+and to inject input, or `backends/device.js`, which talks to the
+WebDriverAgent running on a USB-tethered device — and serves both over plain HTTP/WebSocket behind a shareable token link (exchanged
 for an httpOnly cookie on first load). Everything above the backend (auth,
 shares, tunnels, the player, the gallery) is target-agnostic. Links minted for other people expire on
 their own.
@@ -41,7 +42,7 @@ flowchart TB
             info["/api/info<br/>simulator · bounds · stream cfg"]
             gal["/gallery — gallery.js<br/>owner only · listing-matched names<br/>sips thumbnails"]
         end
-        subgraph be["backends/simulator.js — the backend"]
+        subgraph be["the backend — backends/simulator.js (or backends/device.js)"]
             src["openMjpeg() · h264Pipeline()"]
             queue["input() → SerialQueue<br/>FIFO, one axe at a time"]
             shot["screenshot() · bounds"]
@@ -77,6 +78,8 @@ flowchart TB
     shot -- "xcrun simctl io screenshot" --> sim
     axe --> sim
     sim -- "frames" --> axe
+    src -. "--device: GET WDA MJPEG via ios forward" .-> wda["WebDriverAgent<br/>on a bench device"]
+    shot -. "--device: WDA /screenshot · /window/size" .-> wda
     hub -. "status: idle | live | dead (broadcast to all WS)" .-> ptr
     vhub -. "status: idle | live | dead (broadcast to all WS)" .-> ptr
     remote -. "establishes the tunnel the browser reaches" .-> srv
@@ -125,7 +128,7 @@ stateDiagram-v2
 ```
 
 Per-run configuration, resolved once at startup and never mutated: `PORT`,
-`HOST`, `FPS`, `QUALITY`, `SCALE`, the backend (which simulator, its logical
+`HOST`, `FPS`, `QUALITY`, `SCALE`, the backend (which simulator or device, its logical
 `bounds`, whether the H.264 path exists — helper built, screen size measured —
 and its picture size), and the set of tokens (the registry gains no entries after startup; shares
 only expire out of it).
@@ -153,6 +156,18 @@ every link at once.
 state. Without `--udid`, the server auto-picks — preferring one that's already
 booted. `/api/info` reports the chosen device and its logical bounds, which the
 client uses to size the view before the first frame arrives (no layout flash).
+
+**Watch a real bench device.** `qa-device up primary`, then
+`./scripts/start.sh --device primary` (a role resolves to the device's UDID and
+its WDA port through `qa-device`; `--device <udid> --wda <url>` works without
+it). The server checks WDA, names the device from go-ios (`MGL-QA-16E`), sets
+WDA's stream to the `--fps`/`--scale`/`--quality` flags (30 fps by default
+here), forwards the device's MJPEG port with `ios forward`, and serves the
+same page, links and shares — the picture runs at ~28 fps. The device is
+view-only for now: every input answers "input on a real device is not
+supported yet", while the screenshot control works (WDA's `/screenshot`). A
+WDA that does not answer stops startup with `Start it with: qa-device up
+<role>`; the forward is removed when the server exits.
 
 **Drive the UI by touch.** Click or tap to tap; drag to swipe; hold ≥500 ms
 without moving for a long-press. The browser sends normalized `(0..1, 0..1)`
@@ -221,7 +236,10 @@ Known and accepted, not defects:
 - **US keyboard only.** AXe's `type` uses HID keycodes — no accented or
   non-ASCII characters.
 - **Single touch.** No pinch, no rotate, no multi-finger gestures.
-- **One simulator per server.** The UDID is fixed at startup.
+- **One target per server.** A simulator or a device, fixed at startup;
+  `--device` and `--udid` refuse each other.
+- **A device is view-only, MJPEG-only for now.** No input and no H.264 from a
+  device yet; a device that auto-locks shows its lock screen.
 - **No stream heartbeat beyond start/stop.** If the AXe process *hangs* rather
   than exits, the status dot can stay green until something eventually throws.
   The H.264 pipeline's status stays `live` too, but the page notices the

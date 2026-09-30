@@ -782,3 +782,29 @@ cheap to change.
 - **WDA session recovery:** on a `404`/invalid-session answer, re-create the
   session and retry the request once; a second failure surfaces as an error
   ack. Never a retry loop.
+
+---
+
+## 2026-09-30 — Device video mechanics (9.2, reversible)
+
+Small calls made while building the device backend. Each is cheap to change.
+
+- **Device MJPEG defaults to 30 fps** (simulator stays 15). WDA's server keeps
+  up (27–28 fps measured at scale 0.5), and 9.2's bar is ≥25 fps with no flags.
+  An explicit `--fps` still wins.
+- **The forward is proven before the server listens.** Startup GETs the
+  forwarded port until it answers `200 multipart/x-mixed-replace`; any other
+  answer fails at once, and go-ios's own bind failure is checked *after* an
+  answer, so a stranger holding the port is never streamed. The boundary comes
+  from that header rather than a constant.
+- **A dead forward is not respawned.** `openMjpeg()` throws and the log says
+  to restart the server. A replug usually strands the bench's tunnel too
+  (`qa-device up` fixes both); auto-respawn can come later if it bites.
+- **`--wda` without `--device` is refused** rather than ignored, like `--share`
+  without auth.
+- **Startup failures of either backend print one line and exit 1** instead of
+  a stack trace.
+
+**Rejected:** hardcoding WDA's boundary (it would silently break on a WDA that
+changes it); polling a non-MJPEG answer until the timeout (it cannot become
+WDA's stream).

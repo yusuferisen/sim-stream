@@ -299,3 +299,23 @@ aside → MJPEG only and `/video` 404. Gotcha: on the clone's first minute
 after boot `axe tap` took ~5 s and the probe screenshot timed out, turning
 H.264 off for that run — a restart fixed it. `npm test` 126/126 (27 new in
 `test/mjpeg.test.js`, `test/queue.test.js`, `test/simulator-backend.test.js`).
+
+## 2026-09-30 — 9.2 (device video — a bench iPhone in the browser, view-only)
+
+`backends/device.js` adds the second backend: `--device <udid|role>` (roles
+through `qa-device`) with `--wda <url>`; it checks WDA, names the device from
+`ios info`, opens a WDA session with `--fps`/`--scale`/`--quality` as WDA's
+MJPEG settings (30 fps default in device mode), measures `/window/size`, and
+owns an `ios forward` of WDA's port 9100 to a free host port, proven to answer
+with WDA's MJPEG before the server listens. Input is refused ("not supported
+yet"), H.264 is off, screenshots come from WDA. `server.js` selects the backend
+by flag and prints `device:` in the banner; `start.sh` skips the AXe check in
+device mode. Verified on the primary bench iPhone 16e: `/stream` at 27–28 fps
+(scale 0.5, q75), live in Chrome with a green dot, token gone from the URL, no
+respawn on reload, input error ack, 1170×2532 screenshot, a 40 s share cut at
+its deadline then `401`, no forward left after Ctrl-C, a dead `--wda` exits
+with `qa-device up primary`. Gotchas: WDA's boundary header is
+`--BoundaryString` with the dashes (taken verbatim); go-ios binds the forward
+on all interfaces; `POST /wda/unlock` timed out on the locked 16e while
+`/wda/homescreen` woke and unlocked it — relevant for 9.3 (device input).
+`npm test` 140/140 (14 new in `test/device-backend.test.js`).

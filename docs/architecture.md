@@ -9,7 +9,8 @@
 ## Shape
 
 A single-process ESM Node server that translates browser events into commands
-against one **backend** — today the iOS Simulator through the AXe CLI — and
+against one **backend** — the iOS Simulator through the AXe CLI, or a real
+bench device through WebDriverAgent — and
 pipes the backend's video back out: as MJPEG always, and as H.264 when the
 optional encoder helper is built. There is no required build step, no
 database, no framework beyond Express + `ws`, and no state that outlives the
@@ -19,6 +20,7 @@ process.
 |---|---|
 | `server.js` | The target-agnostic server: arg parsing, the auth check sites, HTTP routes, both WebSocket endpoints, wiring the hubs to the backend, the screenshot control's destination, the banner, shutdown. Spawns nothing but `sips`. |
 | `backends/simulator.js` | The simulator backend (§ Backends): simulator discovery and boot, `axe` resolution, the bounds table, the `axe stream-video` MJPEG source (AXe's HTTP preamble stripped), the H.264 capture pipeline (AXe piped into the helper), input event → `axe` argv, `simctl` screenshots. Import-safe; its pure pieces (`pickSimulator`, `boundsForDeviceType`, `axeInputArgs`, `axeTimeoutMs`, `stripHttpPreamble`) are unit-tested. |
+| `backends/device.js` | The device backend (§ Backends, *Device backend*): `--device` resolution (a UDID, or a bench role through `qa-device`), the WDA client and its one-retry session recovery, WDA's MJPEG settings, the `ios forward` child it owns, bounds and screenshots from WDA. Import-safe; its pure pieces (`wdaSettings`, `deviceTarget`, `parseBoundary`, `resolveDeviceSpec`) and the whole startup are tested against a fake WDA and `test/fixtures/fake-ios`. |
 | `backends/queue.js` | `SerialQueue`: the strict FIFO every backend runs its input commands through. Pure. |
 | `mjpeg.js` | `MjpegHub`: refcount, grace window, generation guard and fan-out for the MJPEG source, source-agnostic. Pure, like `h264.js`: the source and the timers are handed in, so it is unit-testable without a simulator. |
 | `h264.js` | The H.264 path's logic (§ H.264 video path): the capture plan, the helper-record parser, the group-of-pictures cache, and `H264Hub` — refcount, grace window, generation guard and per-viewer delivery. Pure, like `shares.js`: the pipeline, the sockets, the clock and the timers are handed in, so it is unit-testable without a simulator. |
@@ -28,7 +30,7 @@ process.
 | `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`, plus the `cloudflared` provider's pieces for tests (`cloudflaredProvider` factory, output parsers, `waitForAuthoritativeDns`). Knows nothing about streaming or input. Import-safe: nothing runs until a provider's hook is called. |
 | `public/index.html` | The entire client — markup, styles, and script in one file: the H.264 player (WebCodecs → `<canvas>`), the MJPEG `<img>` it falls back to, the input layer. Served with one templated substitution. |
 | `helper/` | **Optional** SwiftPM package: `sim-stream-encoder`, raw BGRA frames on stdin → VideoToolbox H.264 on stdout. Built by `npm run build:helper` (or by `start.sh`); nothing requires it (§ H.264 encoder helper). Its pure logic (`EncoderCore`: arguments, AXe's frame layout, output framing) has a `swift test` target. |
-| `scripts/start.sh` | Dev launcher: verifies AXe is present, installs node deps if absent, builds the encoder helper when `swift` is on PATH and the binary is missing or older than its sources (a failed build is reported and skipped, never fatal), handles `--list`, translates `--no-auth` → `--auth false`, `exec`s the server. |
+| `scripts/start.sh` | Dev launcher: verifies AXe is present (skipped with `--device`), installs node deps if absent, builds the encoder helper when `swift` is on PATH and the binary is missing or older than its sources (a failed build is reported and skipped, never fatal), handles `--list`, translates `--no-auth` → `--auth false`, `exec`s the server. |
 | `scripts/video-probe.js` | Verification tool: a scripted `/video` client that reports what arrived (record and keyframe counts, frame rate, close code) and can save the stream for `ffprobe`. Not used by the server. |
 
 ## Dependencies
@@ -41,7 +43,10 @@ process.
   is installable in CI, which is why there is no CI. `swift` (the Xcode
   toolchain) is needed only to build the optional encoder helper. `sips`
   (built into macOS) makes the gallery's thumbnails; without it the gallery
-  shows full images.
+  shows full images. **Device mode only:** `ios` (go-ios) for the
+  port-forward, and a WebDriverAgent already running on the device (the bench's
+  `qa-device up <role>`); `qa-device` itself only when `--device` names a role.
+  AXe and `simctl` are not used then.
 - **No network service on the default path.** Running the tool requires no
   account, no hosted backend, no auth provider, and no storage — it works
   offline and air-gapped. The shipped Tailscale and `cloudflared` providers
@@ -57,7 +62,8 @@ Independent channels, deliberately not multiplexed:
    `multipart/x-mixed-replace; boundary=<the backend's>` and registers the
    response with the `MjpegHub`. The hub opens the backend's MJPEG source —
    for the simulator, `axe stream-video --format mjpeg` with the leading HTTP
-   headers AXe emits stripped off — and writes every chunk of the body to all
+   headers AXe emits stripped off; for a device, WDA's MJPEG server through
+   the backend's `ios forward` — and writes every chunk of the body to all
    registered responses. The browser decodes it natively in an `<img>`.
 2. **Video (H.264), server → viewer.** `WS /video`, present only when the
    encoder helper is built. `H264Hub` opens the backend's H.264 pipeline —
@@ -203,9 +209,13 @@ Places designed to be extended, and the contract each one implies.
   screenshots — is one object behind this interface; `server.js`, `MjpegHub`
   and `H264Hub` call nothing else. Auth, shares, tunnels, the player, the
   gallery and the wire formats are target-agnostic and never change for a new
-  backend. `createSimulatorBackend({udid, mjpeg:{fps,quality,scale},
-  h264:{encoder,fps,scale}, log})` is the one implementation; it is `async`
-  because it boots the simulator and measures its screen.
+  backend. Two implementations, selected by flag in `server.js`:
+  `createSimulatorBackend({udid, mjpeg:{fps,quality,scale},
+  h264:{encoder,fps,scale}, log})` (the default) and
+  `createDeviceBackend({device, wda, mjpeg:{fps,quality,scale}, log})`
+  (`--device`). Both are `async` — they boot or connect and measure the screen
+  — and a creation failure exits the server with the message, before it
+  listens.
 
   | Member | Contract |
   |---|---|
@@ -221,9 +231,48 @@ Places designed to be extended, and the contract each one implies.
   | `stop()` | Tears down anything the backend itself owns (the simulator backend owns nothing: capture processes belong to the hubs, commands are one-shot). Called at shutdown after the hubs stop. |
 
   Log lines the checklist looks for come from the backend through `log`:
-  `[sim] selected:`, `[mjpeg] spawn:`, `[h264] spawn:`. Adding a backend
-  means a second module with this shape and the flag that selects it; the
-  hubs and the routes do not change.
+  `[sim] selected:`, `[mjpeg] spawn:`, `[h264] spawn:`; in device mode
+  `[device] selected:`, `[device] forward ready:`, `[mjpeg] open:`. Adding a
+  backend means another module with this shape and the flag that selects it;
+  the hubs and the routes do not change.
+
+  **Device backend** (`backends/device.js`). `--device <udid|role>` and
+  `--wda <url>` (default `http://localhost:8100`); `primary|secondary|tablet`
+  ask `qa-device udid|port <role>`, and an explicit `--wda` wins over the
+  role's port. `--device` with `--udid`, or `--wda` without `--device`, is
+  refused at startup. Creation, in order, each step failing with its fix:
+  go-ios present (`npm i -g go-ios`) → WDA `/status` answers (else `Start it
+  with: qa-device up <role>`) → identity from `ios info` (`DeviceName`,
+  `ProductType`, `ProductVersion`; WDA's `/wda/device/info` only as a
+  fallback) → a WDA session, with `--fps`/`--scale`/`--quality` applied as
+  `mjpegServerFramerate` / `mjpegScalingFactor` (percent) /
+  `mjpegServerScreenshotQuality`, clamped to WDA's ranges → `bounds` from
+  `/window/size` (points, made portrait) → the forward. The MJPEG rate
+  defaults to 30 in device mode (15 for a simulator).
+
+  *The forward.* A host port the OS reports free, then `ios forward
+  --udid=<U> <port> 9100` as a child the backend owns. Startup waits (10 s)
+  until a GET through it answers `200 multipart/x-mixed-replace`; the
+  boundary is taken verbatim from that header (WDA: `--BoundaryString`). Any
+  other answer fails at once, and the child is judged *after* an answer — if
+  go-ios reported a bind failure or exited, startup fails with its words
+  rather than streaming from whatever holds the port. `stop()` sends SIGTERM
+  then SIGKILL after 1 s; a synchronous `process.on("exit")` hook SIGKILLs it
+  on any exit that skipped `stop()`. go-ios binds the port on all interfaces
+  (it has no bind-address option), as the bench's WDA forwards already are.
+
+  *Members.* `kind: "device"`; `target` = `{udid, name, state: "Connected",
+  runtime: "iOS <ver>", deviceType: <ProductType>}`; `openMjpeg()` is an HTTP
+  GET through the forward — WDA speaks real HTTP, so the body arrives bare —
+  and throws if the forward has exited (nothing respawns it: restart the
+  server); `h264` is `{ok: false}` and `h264Pipeline()` throws; `input()`
+  rejects every event with `input on a real device is not supported yet`;
+  `screenshot()` writes WDA's `/screenshot` (base64 PNG, sessionless) after
+  checking the PNG signature.
+
+  *WDA sessions.* Session-scoped calls that answer `404` / `invalid session
+  id` re-create the session (re-applying the settings, which a restarted WDA
+  lost) and retry once; a second failure is an error. Never a loop.
 - **Remote providers** (`remote.js`, the `PROVIDERS` map). **Every hook is
   optional** — the server calls each through optional chaining, so a provider
   implements only what it needs. `lan` has just `prepare` + `start`; the
@@ -301,7 +350,7 @@ Places designed to be extended, and the contract each one implies.
   Hand-maintained table mapping a simulator device type to logical points.
   **A new device model needs a new entry** — a miss here is the single most
   likely cause of "taps land in the wrong place," and it degrades silently.
-  Simulator-only: a device backend measures its bounds instead.
+  Simulator-only: the device backend measures its bounds instead.
 
 ## H.264 encoder helper (`helper/`) — the contract the server builds on
 
@@ -573,11 +622,20 @@ real banner, splits the hostname across writes and checks the exact argv:
 hostname parsing (not `api.`, not a suffix match), resolving only after
 registration, the ready timeout, an early exit, the missing-binary message,
 SIGKILL escalation, the dead-tunnel log line and the `ERR` filter. No
-network: the DNS wait is injected.
+network: the DNS wait is injected. `backends/device.js` — against an
+in-process fake WDA (JSON API + an MJPEG server) and
+`test/fixtures/fake-ios`, which checks the exact `info` / `forward` argv and
+pipes its port to the fake stream: the settings mapping and clamping, role
+resolution and its refusals, the one-retry session recovery (request count
+pinned), identity/bounds/boundary, a bare multipart body through the forward,
+screenshot and the input refusal, `stop()` killing the forward, a missing WDA
+failing before any forward, go-ios's bind failure, a non-MJPEG listener
+refused at once with the child killed, the `ios info` fallback, and a
+missing `ios`.
 
 Everything else has **no automated coverage**, and the reason is structural:
 every other meaningful path requires a booted iOS Simulator plus the AXe binary
-on macOS, so nothing here runs in CI. Verification is therefore manual and the
+on macOS (or a bench device with WDA running), so nothing here runs in CI. Verification is therefore manual and the
 phase gate is a browser session:
 
 1. `./scripts/start.sh` — confirm it selects/boots a simulator and prints a URL.
@@ -622,6 +680,16 @@ phase gate is a browser session:
     link the gallery link is absent and `/gallery` answers `403`;
     `curl -H 'x-token: <owner>' …/gallery/file/..%2F..%2Fx.png` must be `404`
     and an unauthenticated `…/gallery/file/%E0%A4%A.png` a plain-text `400`.
+11. If touching `backends/device.js` (bench device, `qa-device up primary`
+    first): `node server.js --device primary --share short=40s` — the log
+    shows `[device] selected:` with the device's name and `forward ready`;
+    Chrome shows the live screen with a green dot and `MJPEG`;
+    `curl -H 'x-token: <T>' …/stream` for 5 s counts ≥25 fps × 5 boundaries;
+    a reload logs no second `[mjpeg] open:`; a tap toasts "not supported
+    yet"; the screenshot control saves a device-sized PNG; the share's stream
+    ends at its deadline and its link is then `401`; after Ctrl-C
+    `pgrep -f 'ios forward --udid='` finds nothing; and `--wda
+    http://localhost:<unused>` exits at startup with `qa-device up primary`.
 
 What remains uncovered in `server.js` — `parseArgs`, the cookie handoff, the
 upgrade handler — runs side effects at import. Covering it means moving it

@@ -5,6 +5,7 @@
 #   ./scripts/start.sh                           # auto-pick a simulator, start server
 #   ./scripts/start.sh --list                    # list available simulators and exit
 #   ./scripts/start.sh --udid <UDID>             # use a specific simulator
+#   ./scripts/start.sh --device primary          # a QA-bench device over WDA (qa-device up primary first)
 #   ./scripts/start.sh --port 9090               # custom port (default 8080)
 #   ./scripts/start.sh --remote lan              # bind to 0.0.0.0 (LAN access)
 #   ./scripts/start.sh --remote tailscale-serve  # private HTTPS over tailnet
@@ -41,7 +42,12 @@ if [[ "${1:-}" == "--list" ]]; then
   exit 0
 fi
 
-if ! command -v axe >/dev/null 2>&1; then
+# Device mode (--device) drives WebDriverAgent and needs go-ios, not AXe; the
+# server checks for both itself.
+DEVICE_MODE=0
+for arg in "$@"; do [[ "$arg" == "--device" ]] && DEVICE_MODE=1; done
+
+if [[ "$DEVICE_MODE" == 0 ]] && ! command -v axe >/dev/null 2>&1; then
   echo ""
   echo "  AXe CLI is required but not installed."
   echo ""

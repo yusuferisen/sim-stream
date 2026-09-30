@@ -1,20 +1,22 @@
 # sim-stream — repo conventions
 
-Node server that streams a running iOS Simulator to a browser with interactive
-input, via the AXe CLI. Single surface at the repo root (no surface folders).
+Node server that streams a running iOS Simulator (via the AXe CLI) — or, with
+`--device`, a QA-bench iPhone/iPad (via WebDriverAgent) — to a browser with
+interactive input. Single surface at the repo root (no surface folders).
 
 ## Layout
 
 ```
 server.js            HTTP + WebSocket + auth — target-agnostic; talks to one backend
 backends/simulator.js  The simulator backend: discovery/boot, bounds, AXe capture + input, simctl screenshots
+backends/device.js   The device backend (--device): WDA session + settings, owned `ios forward` of WDA's MJPEG, WDA bounds/screenshots
 backends/queue.js    SerialQueue — the input FIFO every backend runs commands through (pure, unit-tested)
 mjpeg.js             The MJPEG hub — refcount, grace window, generation guard (pure, unit-tested)
 shares.js            Token registry — owner token + expiring --share tokens (pure, unit-tested)
 h264.js              H.264 path logic — record parser, GOP cache, the /video hub (pure, unit-tested)
 tap-label.js         Tap by accessibility label — axe tap args + AXe error → toast line (pure, unit-tested)
 gallery.js           Screenshot gallery rules — names, listing-matched serving, thumbnail cache, page (unit-tested)
-test/                node:test suites for the import-safe modules (shares, h264, mjpeg, gallery, tap-label, remote, queue, simulator backend)
+test/                node:test suites for the import-safe modules (shares, h264, mjpeg, gallery, tap-label, remote, queue, simulator + device backends); fixtures/ holds fake cloudflared + fake ios
 remote.js            Remote-access providers (prepare/start/stop), --remote <name>
 public/index.html    The entire client — markup, styles, script in one file
 scripts/start.sh     Dev launcher: checks AXe, installs deps, builds the helper, boots the sim
@@ -30,7 +32,9 @@ There is no required build step. `npm test` covers only the import-safe modules 
 `shares.js` (the token registry), `h264.js` and `mjpeg.js` (the two hubs'
 logic), `gallery.js` (the screenshot gallery's serving rules), `tap-label.js`
 (tap-by-label arguments and error text), `backends/queue.js` and the pure
-parts of `backends/simulator.js` (selection, bounds, input → `axe` argv); the
+parts of `backends/simulator.js` (selection, bounds, input → `axe` argv),
+`backends/device.js` against a fake WDA + fake `ios` (startup, forward,
+session retry, refusals); the
 optional encoder helper has its own `swift test`; everything else — every
 process the backend spawns — is verified by hand — see below.
 
@@ -41,6 +45,7 @@ npm install                                  # deps: express, ws
 ./scripts/start.sh --udid <UDID>             # pin to one simulator
 ./scripts/start.sh --remote lan              # reachable on the LAN
 ./scripts/start.sh --share demo=2h           # also mint an expiring link
+./scripts/start.sh --device primary          # a QA-bench device over WDA (qa-device up primary first)
 node server.js --port 9090                   # server directly; same flags
 for f in server.js remote.js shares.js h264.js mjpeg.js gallery.js tap-label.js backends/*.js; do node --check $f; done   # syntax gate
 npm run build:helper                         # optional: build helper/ (needs swift)
@@ -58,10 +63,13 @@ reload to confirm the 5 s grace window doesn't respawn AXe, and narrow the
 viewport below 720 px for the bottom sheet. If you touch `remote.js`, verify
 at least the `lan` provider from a second device. If you touch the H.264 path
 (`h264.js`, the pipeline in `backends/simulator.js`, `helper/`), run that
-section's `video-probe` step too.
+section's `video-probe` step too. If you touch `backends/device.js`, run the
+checklist's device step against the **primary bench device** (never a
+personal phone).
 
 Prerequisites: macOS with Xcode simulators, Node 18+ (ESM),
-`brew install cameroncooke/axe/axe`.
+`brew install cameroncooke/axe/axe`. Device mode: go-ios (`npm i -g go-ios`)
+and the bench's WDA (`qa-device up <role>`).
 
 ## Working rules
 
@@ -84,6 +92,6 @@ Prerequisites: macOS with Xcode simulators, Node 18+ (ESM),
   or leak it past exit.
 - A new simulator model needs an entry in `boundsForDeviceType()`
   (`backends/simulator.js`); without one, taps mis-map silently.
-- Nothing outside `backends/` spawns `axe` or `simctl`. `server.js`, the hubs
+- Nothing outside `backends/` spawns `axe`, `simctl` or `ios`, or talks to WDA. `server.js`, the hubs
   and the routes see only the backend interface (`docs/architecture.md`
   § Backends); a new target is a new module with that shape plus its flag.

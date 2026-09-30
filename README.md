@@ -38,6 +38,9 @@ decisions, and history live in [`docs/`](docs/).
 - [AXe CLI](https://github.com/cameroncooke/AXe) — `brew install cameroncooke/axe/axe`
   (a version whose `axe tap` knows `--tap-style`; 1.8.0 does)
 - Node.js 18+ (uses ESM, top-level `crypto.timingSafeEqual`, `EventEmitter`)
+- Device mode only (`--device`, see [Real devices](#real-devices-qa-bench)):
+  [go-ios](https://github.com/danielpaulus/go-ios) (`npm i -g go-ios`) and a
+  running WebDriverAgent on the device — AXe is not needed then
 - Optional: the Swift toolchain that ships with Xcode, to build the H.264
   encoder helper (30 fps video in the page on https/`localhost`, and on
   `/video`). Without it the page shows MJPEG and everything else works.
@@ -56,6 +59,7 @@ npm install
 ./scripts/start.sh                          # auto-pick a simulator, start on :8080
 ./scripts/start.sh --list                   # list available simulators
 ./scripts/start.sh --udid <UDID>            # pin to a specific simulator
+./scripts/start.sh --device primary         # a QA-bench iPhone instead (see Real devices)
 ./scripts/start.sh --port 9090              # custom port
 ./scripts/start.sh --remote lan             # expose on the LAN
 ./scripts/start.sh --remote tailscale-serve # private HTTPS over your tailnet
@@ -87,6 +91,27 @@ not built. `start.sh` builds it for you when `swift` is available; running
 `node server.js` directly, build it once with `npm run build:helper`.
 
 Open the URL in any browser. You should see the live simulator screen.
+
+### Real devices (QA bench)
+
+`--device <udid|role>` drives a real, USB-tethered iPhone or iPad instead of
+a simulator, through the WebDriverAgent (WDA) already running on it. Only
+prepared **QA-bench** devices — never a personal phone: the tool cannot tell
+them apart, and a share link to a device exposes whatever is signed in on it.
+
+```sh
+qa-device up primary                        # bench tooling: tunnel + WDA (the tool never starts WDA)
+./scripts/start.sh --device primary         # role → UDID and WDA port via qa-device
+node server.js --device <UDID> --wda http://localhost:8100   # without qa-device
+```
+
+The page, links, shares and tunnels work exactly as with a simulator. The
+picture is WDA's own MJPEG stream (~28 fps at the defaults), reached through
+an `ios forward` the server owns and removes on exit; `--fps`/`--scale`/
+`--quality` become WDA's stream settings, and `--fps` defaults to 30 here.
+**For now the device is view-only** — input answers "not supported yet", and
+the page shows MJPEG (H.264 from a device comes later). A WDA that does not
+answer stops the server at startup with the command that fixes it.
 
 ### Share links that expire
 
@@ -230,10 +255,12 @@ All flags can be passed to `scripts/start.sh` or to `node server.js` directly:
 |------------------|-------------|-----------------------------------------------|
 | `--port <N>`     | `8080`      | HTTP port                                     |
 | `--host <addr>`  | `127.0.0.1` | Bind address. Use `0.0.0.0` for LAN           |
-| `--fps <N>`      | `15` / `30` | Target capture FPS, 1–30. MJPEG defaults to 15 (AXe delivers ~7–10 whatever you ask); the H.264 stream defaults to 30. Giving the flag sets both |
+| `--fps <N>`      | `15` / `30` | Target capture FPS, 1–30. MJPEG defaults to 15 (AXe delivers ~7–10 whatever you ask); the H.264 stream, and a device's MJPEG, default to 30. Giving the flag sets both |
 | `--quality <N>`  | `75`        | JPEG quality (1–100)                          |
 | `--scale <N>`    | `0.5`       | Frame size multiplier (0.1–1.0), for both video paths |
 | `--udid <UDID>`  | auto        | Specific simulator UDID                       |
+| `--device <udid\|role>` | —    | Drive a real bench device over WebDriverAgent instead of a simulator; `primary`/`secondary`/`tablet` resolve through `qa-device`. Excludes `--udid` |
+| `--wda <url>`    | `http://localhost:8100` | WDA's URL in device mode (a role's own port when `--device` is a role) |
 | `--token <str>`  | random hex  | Your own auth token — valid until the process exits. Every route and the WebSocket accept a token as `?token=…`, an `x-token` header (scripts), or the httpOnly cookie set when the page is opened. One credential is checked per request: the query if present, else the header, else the cookie |
 | `--share [label=]<ttl>` | —    | Mint an extra link that expires after `<ttl>` (`45s`, `30m`, `2h`, `1d`). Repeatable. See [Share links that expire](#share-links-that-expire) |
 | `--auth false`   | on          | Disable auth (local only)                     |
@@ -284,9 +311,10 @@ Coordinates travel as normalized `(0..1, 0..1)` from the browser; the
 backend maps them to simulator logical points using bounds it computes once
 at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
 
-Everything that knows the target is a simulator — discovery, capture, input,
-screenshots — lives in `backends/simulator.js` behind one interface
-(`docs/architecture.md` § Backends); `server.js` is target-agnostic.
+Everything that knows what the target is — discovery, capture, input,
+screenshots — lives behind one interface (`docs/architecture.md` § Backends):
+`backends/simulator.js` for a simulator, `backends/device.js` for a real
+device (`--device`); `server.js` is target-agnostic.
 
 ### Key files
 
@@ -294,6 +322,8 @@ screenshots — lives in `backends/simulator.js` behind one interface
 |---------------------------|----------------------------------------------------------------------|
 | `server.js`               | Node.js server: HTTP, WS endpoints, auth, wiring the hubs to the backend |
 | `backends/simulator.js`   | The simulator backend: discovery/boot, bounds, AXe capture + input, `simctl` screenshots |
+| `backends/device.js`      | The device backend: WDA session + settings, `ios forward` of WDA's MJPEG, bounds and screenshots from WDA |
+| `test/device-backend.test.js` | Unit tests for it against a fake WDA and `test/fixtures/fake-ios` (`npm test`; no device needed) |
 | `backends/queue.js`       | `SerialQueue`: the input FIFO every backend runs commands through   |
 | `test/simulator-backend.test.js`, `test/queue.test.js` | Unit tests for their pure parts (`npm test`; no simulator needed) |
 | `mjpeg.js`                | The MJPEG hub: refcount, grace window, generation guard, fan-out     |
@@ -310,7 +340,7 @@ screenshots — lives in `backends/simulator.js` behind one interface
 | `remote.js`               | Pluggable remote-access providers (LAN / Tailscale Serve / Funnel / Cloudflare quick tunnel) |
 | `test/remote.test.js`     | Unit tests for the `cloudflared` provider against a fake binary (`npm test`) |
 | `public/index.html`       | Single-page client: H.264 `<canvas>` player / MJPEG `<img>`, pointer/gesture detection, toolbar |
-| `scripts/start.sh`        | Dev launcher: checks AXe, installs deps, builds the encoder helper, boots simulator, runs server |
+| `scripts/start.sh`        | Dev launcher: checks AXe (not with `--device`), installs deps, builds the encoder helper, boots simulator, runs server |
 | `helper/`                 | Optional Swift encoder (`npm run build:helper`): AXe raw frames → H.264; contract in `docs/architecture.md` |
 
 ## Limitations
@@ -332,12 +362,17 @@ screenshots — lives in `backends/simulator.js` behind one interface
 
 **"axe CLI not found"** — install it: `brew install cameroncooke/axe/axe`.
 
+**"WebDriverAgent is not answering at …"** (device mode) — WDA or the bench
+tunnel is down: run the printed `qa-device up <role>`. **"ios forward could
+not forward port …"** — go-ios could not open the stream port; the message
+carries go-ios's own words.
+
 **Start script crashes with `EXTRA[@]: unbound variable`** — this was a
 bash 3.2 bug that was fixed; make sure you're on the latest `scripts/start.sh`.
 
 **Tap lands in the wrong place** — check that `/api/info` returns the
 correct `bounds` for your device. The bounds table in
-`boundsForDeviceType()` (server.js) may need a new entry for a newer
+`boundsForDeviceType()` (`backends/simulator.js`) may need a new entry for a newer
 device model.
 
 **Browser shows the screen but input does nothing** — the "input" dot in

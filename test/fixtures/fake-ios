@@ -1,0 +1,56 @@
+#!/usr/bin/env node
+// Stand-in (extensionless, so `node --test` does not run it as a test) for
+// go-ios's `ios` in test/device-backend.test.js. FAKE_IOS_MODE picks the
+// behavior; the log lines mirror go-ios 1.3.2's real JSON output.
+//
+//   ios --version
+//   ios info --udid=<U>                      → device JSON (mode "noinfo": fails)
+//   ios forward --udid=<U> <hostPort> 9100   → listens on hostPort and pipes each
+//                                              connection to 127.0.0.1:$FAKE_MJPEG_PORT
+//                                              (mode "inuse": go-ios's bind failure)
+import net from "node:net";
+
+const mode = process.env.FAKE_IOS_MODE || "ok";
+const [cmd, ...rest] = process.argv.slice(2);
+const log = (level, msg, extra = {}) =>
+  console.log(JSON.stringify({ time: new Date().toISOString(), level, msg, module: "go-ios/forward", ...extra }));
+
+if (cmd === "--version") {
+  console.log('{"version":"1.3.2"}');
+  process.exit(0);
+}
+
+if (cmd === "info") {
+  if (mode === "noinfo" || rest[0] !== `--udid=${process.env.FAKE_IOS_UDID}`) {
+    process.stderr.write('{"level":"fatal","msg":"device not found"}\n');
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ DeviceName: "MGL-QA-16E", ProductType: "iPhone17,5", ProductVersion: "26.6.2", DeviceClass: "iPhone" }));
+  process.exit(0);
+}
+
+if (cmd === "forward") {
+  // The backend's exact arguments: anything else fails the way a bad flag would.
+  const [udidFlag, hostPort, phonePort] = rest;
+  if (udidFlag !== `--udid=${process.env.FAKE_IOS_UDID}` || phonePort !== "9100" || !/^\d+$/.test(hostPort)) {
+    process.stderr.write(`unexpected arguments: ${rest.join(" ")}\n`);
+    process.exit(3);
+  }
+  log("INFO", "start listening, forwarding to device", { hostPort: Number(hostPort), phonePort: 9100 });
+  if (mode === "inuse") {
+    log("ERROR", "failed to forward port", { err: `forward: failed listener with err: listen tcp 0.0.0.0:${hostPort}: bind: address already in use` });
+    process.exit(1);
+  }
+  const server = net.createServer((sock) => {
+    const up = net.connect(Number(process.env.FAKE_MJPEG_PORT), "127.0.0.1");
+    sock.pipe(up).pipe(sock);
+    const end = () => { sock.destroy(); up.destroy(); };
+    sock.on("error", end);
+    up.on("error", end);
+  });
+  server.listen(Number(hostPort), "0.0.0.0");
+  process.on("SIGTERM", () => process.exit(0));
+} else if (cmd !== "info") {
+  process.stderr.write(`unknown command ${cmd}\n`);
+  process.exit(2);
+}
