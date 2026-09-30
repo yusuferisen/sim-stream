@@ -1,0 +1,42 @@
+#!/usr/bin/env node
+// Stand-in (extensionless, so `node --test` does not run it as a test) for `cloudflared` in test/remote.test.js. FAKE_CF_MODE picks the
+// behavior; the output lines mirror cloudflared 2026.9.3's real stderr.
+const mode = process.env.FAKE_CF_MODE || "ok";
+if (process.argv[2] === "--version") {
+  console.log("cloudflared version 2026.9.3 (fake)");
+  process.exit(0);
+}
+// The provider's exact arguments: anything else fails the way a bad flag would.
+const expected = ["tunnel", "--no-autoupdate", "--grace-period", "1s", "--url", `http://127.0.0.1:${process.env.FAKE_CF_PORT}`];
+if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expected)) {
+  process.stderr.write(`unexpected arguments: ${process.argv.slice(2).join(" ")}\n`);
+  process.exit(3);
+}
+const err = (s) => process.stderr.write(s + "\n");
+err("2026-09-30T10:00:00Z INF Requesting new quick Tunnel on trycloudflare.com...");
+err("2026-09-30T10:00:00Z INF +--------------------------------------------------------------------------------------------+");
+err("2026-09-30T10:00:00Z INF |  Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):  |");
+if (mode === "die") {
+  err('2026-09-30T10:00:01Z ERR failed to request quick Tunnel: Post "https://api.trycloudflare.com/tunnel": dial tcp: lookup api.trycloudflare.com: no such host');
+  process.exit(1);
+}
+// The hostname arrives split across two writes, as a pipe may deliver it.
+process.stderr.write("2026-09-30T10:00:00Z INF |  https://brave-otter-quiet-");
+setTimeout(() => {
+  err("lake.trycloudflare.com                                                    |");
+  if (mode === "hang") return;
+  setTimeout(() => {
+    err("2026-09-30T10:00:02Z INF Registered tunnel connection connIndex=0 connection=abc event=0 ip=198.41.200.13 location=ams01 protocol=quic");
+    if (mode !== "errlater") return;
+    setTimeout(() => {
+      err("2026-09-30T10:01:00Z INF Retrying connection in up to 2s connIndex=0");
+      err('2026-09-30T10:01:00Z ERR  error="unexpected EOF" connIndex=0 event=1 ingressRule=0 originService=http://127.0.0.1:18090');
+      err('2026-09-30T10:01:00Z ERR Request failed error="unexpected EOF" connIndex=0 dest=https://brave-otter-quiet-lake.trycloudflare.com/stream event=0 type=http');
+      process.stderr.write("2026-09-30T10:01:00Z ERR Connection terminated error=");
+      setTimeout(() => err('"timeout: no recent network activity" connIndex=0'), 10);
+    }, 30);
+  }, 20);
+}, 20);
+if (mode === "stubborn") process.on("SIGTERM", () => {});
+else process.on("SIGTERM", () => process.exit(0));
+setInterval(() => {}, 1000);

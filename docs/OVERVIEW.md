@@ -16,7 +16,7 @@ There is no account, no hosted backend, and no required build step — `npm i &&
 node server.js`. An optional Swift helper adds a 30 fps H.264 stream beside the
 MJPEG one, which the page plays wherever the browser can decode it (https or
 `localhost`) and falls back from on its own. Reaching it from outside the machine is opt-in: `--remote` selects
-a provider (Tailscale today), and that is the only point at which anything
+a provider (LAN, Tailscale, or a Cloudflare quick tunnel), and that is the only point at which anything
 leaves the host.
 
 ## Architecture
@@ -40,7 +40,7 @@ flowchart TB
             info["/api/info<br/>simulator · bounds · stream cfg"]
             gal["/gallery — gallery.js<br/>owner only · listing-matched names<br/>sips thumbnails"]
         end
-        remote["remote.js<br/>PROVIDERS: lan · tailscale-serve · tailscale-funnel"]
+        remote["remote.js<br/>PROVIDERS: lan · tailscale-serve · tailscale-funnel · cloudflared"]
         axe["axe CLI"]
         enc["sim-stream-encoder<br/>(optional Swift helper)"]
         sim["iOS Simulator"]
@@ -124,8 +124,9 @@ only expire out of it).
 ## User stories, as currently implemented
 
 **Watch a simulator from another device.** Run `./scripts/start.sh --remote lan`
-(or `--remote tailscale-serve` for the tailnet, `--remote tailscale-funnel` for
-a publicly reachable URL). The launcher checks that AXe is installed, installs
+(or `--remote tailscale-serve` for the tailnet; `--remote tailscale-funnel`, or
+`--remote cloudflared` with no account at all, for a publicly reachable https
+URL — the one route that gives a phone the 30 fps H.264 stream). The launcher checks that AXe is installed, installs
 node deps if missing, boots the chosen simulator if it isn't running, and
 prints a URL with the token embedded. Opening it sets an httpOnly cookie and
 redirects to the token-free URL, then shows the live screen; the stream and

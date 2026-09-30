@@ -9,7 +9,7 @@
 
 - **Project:** sim-stream
 - **Target milestone:** Safe public sharing — stop here for review
-- **Status:** `in-progress`
+- **Status:** `milestone-reached`
 - **Updated:** 2026-09-30
 
 ---
@@ -45,8 +45,8 @@
 - [x] **Phase 5 — Token & session hardening**
   - [x] 5.1 Cookie handoff → both check sites share one `requestAuthorized()`; the WS upgrade now also accepts `x-token`
   - [x] 5.2 Expiring per-share tokens → `--share [label=]<ttl>`; expiry also closes open connections, and one credential decides per request [model: fable]
-- [ ] **Phase 6 — Cloudflare quick tunnel**
-  - [ ] 6.1 `cloudflared` provider — anonymous quick tunnel, mandatory `stop`; verify the edge does not buffer MJPEG
+- [x] **Phase 6 — Cloudflare quick tunnel**
+  - [x] 6.1 `cloudflared` provider — anonymous quick tunnel → edge does not buffer MJPEG; link waits for DNS
 - [ ] 🏁 **MILESTONE: Safe public sharing** ← default stop point
 - [ ] **Phase 6b — Gated public sharing (Cloudflare Access)**
   - [ ] 6b.1 `cloudflare-access` named-tunnel provider — Access policy in front of the tunnel
@@ -64,27 +64,25 @@
 
 ## Current Status
 
-- **Current phase / sub-phase:** 6.1 — `cloudflared` quick-tunnel provider
-- **State:** not-started
-- **Last completed:** 8.2 (tap by accessibility label — `tap-label` event → `axe tap --label=`/`--id=`; AXe's error in the toast)
-- **Build:** green (`node --check` ×6) · **Tests:** 87/87 `npm test` + 11 `swift test` (helper; untouched) · **Simulator-verified:** yes (sandbox clone: label taps over `/ws` and in Chrome, Settings → General → About; no/multiple-match toasts; narrow-viewport sheet closes)
+- **Current phase / sub-phase:** 🏁 milestone (safe public sharing) reached — awaiting owner review
+- **State:** milestone-reached
+- **Last completed:** 6.1 (`cloudflared` quick-tunnel provider — `--remote cloudflared`)
+- **Build:** green (`node --check` ×6) · **Tests:** 99/99 `npm test` + 11 `swift test` (helper; untouched) · **Simulator-verified:** yes (sandbox clone through real quick tunnels: MJPEG + H.264, share expiry at the edge; QA bench iPhone Safari showed `H.264` and taps landed)
 
 ---
 
 ## Next Concrete Action
 
-> Implement 6.1 (Cloudflare quick tunnel): a `cloudflared` provider in
-> `remote.js` — anonymous `trycloudflare.com` tunnel, mandatory `stop`, fail
-> immediately with the install command when the binary is missing — and verify
-> through a real tunnel that the edge does not buffer MJPEG, plus the
-> real-iPhone H.264 check.
-> Scope: `docs/ROADMAP.md` § Phase 6; `cloudflared` is not installed here (`brew install cloudflared`, no account).
+> Owner review of the 🏁 Safe public sharing milestone (cookie handoff,
+> expiring `--share` links, the `cloudflared` quick tunnel), then tick the
+> milestone box. Past it, every remaining phase needs an owner prerequisite:
+> 6b (Cloudflare Access gate) needs a domain on a Cloudflare account; 8b
+> (ngrok provider) needs an ngrok account and authtoken.
 
 ---
 
 ## Open Decisions (reversible — defaults chosen, proceeding)
 
-- **Missing `cloudflared` binary in 6.1** → chose **fail immediately with the install command**, mirroring `start.sh`'s `axe` check → DECISIONS.md § Phase 6.2 deferred (phase 6)
 - **Multi-simulator support** → chose **out of scope; one simulator per server** → DECISIONS.md § Build vs. adopt
 
 ---
@@ -97,7 +95,7 @@
 
 ## Assumptions & Risks
 
-- **Automated tests cover only the import-safe modules** (`npm test`: `shares.js`, the token registry; `h264.js`, the `/video` hub's logic; `gallery.js`, the gallery's serving rules; `tap-label.js`, tap-by-label arguments and error text). Every other path — including the process plumbing that spawns AXe and the encoder — needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is still the manual checklist in `docs/architecture.md` § Testing strategy.
+- **Automated tests cover only the import-safe modules** (`npm test`: `shares.js`, the token registry; `h264.js`, the `/video` hub's logic; `gallery.js`, the gallery's serving rules; `tap-label.js`, tap-by-label arguments and error text; `remote.js`'s `cloudflared` provider, against a fake binary). Every other path — including the process plumbing that spawns AXe and the encoder — needs a booted simulator plus the AXe binary on macOS, so nothing runs in CI. The phase gate is still the manual checklist in `docs/architecture.md` § Testing strategy.
 - **`boundsForDeviceType()` is a hand-maintained table.** A simulator model missing from it mis-maps taps silently — check `/api/info` bounds first when taps land wrong.
 - **The operator's own token still never expires** within a run, and it is the one on the `local:` / `--remote` banner lines. Only `--share` links die on their own — hand those out, not the top link.
 - **Tailscale providers were not re-run after 5.2 (expiring share links) changed the provider contract** (`start` now returns a token-free URL). `lan` was verified from a real phone and the Tailscale edit is the same one-line shape, but check the printed links on the next `tailscale-serve`/`-funnel` use.
@@ -106,10 +104,10 @@
 - **30 fps is this design's ceiling** — AXe caps `--fps` at 30 → DECISIONS.md § Phase 7 capture source. Measured on one host only.
 - **AXe's raw frame layout is reverse-engineered** (64-byte row padding; row count padded to 16 at scale 1.0 only), measured on one device size (1206×2622). Another model or AXe version could differ — a garbled/sheared H.264 picture means `FrameLayout.axe` needs a new measurement.
 - **Taps take 1.0–2.0 s with the page playing H.264** (7.3, measured in Chrome on a sandbox clone; MJPEG alone: 1.0–1.5 s) against the queue's 5 s timeout. Input wins over smoothness (PRD principle 5): lower the capture rate before loosening the queue.
-- **H.264 in iPhone Safari is unverified.** Only desktop Chrome on `localhost` was tested; plain-http `--remote lan` shows MJPEG by design, and the MJPEG fallback there was checked in Chrome, not from a phone. 6.1 (the account-free https tunnel) carries the real-iPhone check.
+- **H.264 in iPhone Safari was checked once** (6.1, the Cloudflare tunnel, QA bench iPhone 16e): header `H.264`, taps land. The MJPEG fallback has still only been seen in Chrome, not on a phone.
 - **The server's H.264 pipeline still has no heartbeat or reconnect limit** — a hung encoder stays `live`. The page copes (falls back after 4 s without frames, never reconnects); a script client must do the same.
 - **Phase 8b needs the owner's ngrok account** (`ngrok` not installed; authtoken in the Keychain as `NGROK_AUTHTOKEN`). A run reaching 8b should halt.
-- **Cloudflare's edge may buffer `multipart/x-mixed-replace`.** Test an actual tunnel before recommending either Phase 6 provider over Tailscale. `cloudflared` is not installed on this host yet (`brew install cloudflared`; no account needed).
+- **Quick tunnels have no uptime guarantee.** One 6.1 run dropped every tunnel connection at once after ~111 s (unexplained; tunnel-level `ERR` lines are now logged as `[remote:cloudflared]`). A share meant to last hours may be better on Tailscale Funnel.
 - **Phase 6b needs a domain on a Cloudflare account** (plus a named tunnel and an Access policy) before it can be built or verified. It sits past the milestone for exactly this reason; a run reaching it should halt.
 
 ---

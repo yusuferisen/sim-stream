@@ -5,39 +5,11 @@
 > the live checklist and all completion truth live in `PROGRESS.md`.
 >
 > Shipped phases (1–5: core streaming, mobile UI, remote providers, the
-> build-vs-adopt evaluation, token & session hardening; 7: the 30 fps H.264
-> capture pipeline and browser player) have been pruned from here. Their narrative is in
+> build-vs-adopt evaluation, token & session hardening; 6: the Cloudflare
+> quick tunnel; 7: the 30 fps H.264 capture pipeline and browser player; 8:
+> screenshot gallery and tap by label) have been pruned from here. Their narrative is in
 > `docs/JOURNAL.md`, their rationale in `docs/DECISIONS.md`, and the system as
 > built is described in `docs/OVERVIEW.md`.
-
----
-
-## Phase 6 — Cloudflare quick tunnel
-
-**Why.** A second exit route that needs no account at all. `cloudflared tunnel
---url http://127.0.0.1:<port>` mints an anonymous `trycloudflare.com` hostname
-on the spot — useful when Tailscale isn't installed, when its macOS GUI-agent
-path is hanging (a failure we've already hit), or when you want Cloudflare's
-larger edge in front of the stream.
-
-**Scope.** One `PROVIDERS` entry implementing `prepare` (bind `127.0.0.1`),
-`start` (spawn the tunnel, parse the assigned hostname out of its output,
-return the token-free base URL — the server adds the tokens), and `stop` — **`stop` is mandatory here**: the tunnel is a
-long-lived child process and without teardown it outlives the server.
-
-**Trade-off to settle before recommending it.** MJPEG is a single long-lived
-`multipart/x-mixed-replace` response and Cloudflare's edge may buffer it —
-which would surface as a stalled first frame or visible stutter. Verify against
-a real tunnel; if it buffers, say so in the README rather than quietly shipping
-a worse path than Tailscale. On the same tunnel, confirm that a short `--share`
-link still cuts the stream at its deadline — expiry has to hold through the
-edge, not just on the LAN. The tunnel is also the first https route to a
-real iPhone, so check the H.264 player there too: the header should read
-`H.264` in iPhone Safari and taps should still land.
-
-**Out of scope.** Installing `cloudflared` — treat a missing binary the way
-`start.sh` already treats a missing `axe`: fail immediately with the install
-command, don't attempt a download.
 
 ---
 
@@ -87,7 +59,7 @@ else. If LAN smoothness turns out to matter, add it as a lettered phase.
 ## Phase 8b — `ngrok` provider
 
 **Parked behind an owner prerequisite, deliberately** — see `DECISIONS.md §
-ngrok provider parked as Phase 8b`. Same provider shape as Phase 6: `prepare`
+ngrok provider parked as Phase 8b`. Same provider shape as `cloudflared` (6.1): `prepare`
 binds `127.0.0.1`, `start` spawns the tunnel and returns the token-free base
 URL, and `stop` is mandatory.
 

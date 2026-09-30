@@ -59,12 +59,14 @@ npm install
 ./scripts/start.sh --port 9090              # custom port
 ./scripts/start.sh --remote lan             # expose on the LAN
 ./scripts/start.sh --remote tailscale-serve # private HTTPS over your tailnet
+./scripts/start.sh --remote cloudflared     # public HTTPS, no account (quick tunnel)
 ./scripts/start.sh --share demo=2h          # also mint a link that expires in 2h
 ./scripts/start.sh --no-auth                # disable token auth (local only!)
 ```
 
 See [Remote access](#remote-access) for the full list of `--remote`
-providers (LAN, Tailscale Serve, Tailscale Funnel for public sharing).
+providers (LAN, Tailscale Serve, and two public routes: Tailscale Funnel and
+an account-free Cloudflare quick tunnel).
 
 The script will boot the selected simulator if it isn't running, then start
 the web server. It prints a URL including a random auth token. Opening it
@@ -129,6 +131,7 @@ device, pass `--remote <provider>`:
 | `lan`               | Same Wi-Fi / LAN                            | `http://<mac-ip>:8080/?token=…`          |
 | `tailscale-serve`   | Any device signed in to your tailnet        | `https://<host>.<tailnet>.ts.net/?token=…` |
 | `tailscale-funnel`  | **Anyone on the internet** with the URL     | `https://<host>.<tailnet>.ts.net/?token=…` |
+| `cloudflared`       | **Anyone on the internet** with the URL     | `https://<random-words>.trycloudflare.com/?token=…` |
 
 Examples:
 
@@ -136,7 +139,20 @@ Examples:
 ./scripts/start.sh --remote lan
 ./scripts/start.sh --remote tailscale-serve
 ./scripts/start.sh --remote tailscale-funnel    # public — for sharing demos
+./scripts/start.sh --remote cloudflared         # public — no account, no setup
 ```
+
+`cloudflared` opens an anonymous Cloudflare [quick
+tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
+the only prerequisite is the binary (`brew install cloudflared` — the server
+exits with that command if it's missing; it never downloads anything). Each
+run gets a new random hostname, printed only once the tunnel answers, and
+the tunnel process is stopped with the server. Both video paths work through
+it: the MJPEG stream is not buffered at Cloudflare's edge (same frame rate as
+`localhost`, first frame in under a second), and since the link is https,
+iPhone Safari plays the 30 fps H.264 stream. Quick tunnels come with no
+uptime guarantee — if every viewer drops at once, the server logs
+cloudflared's error line; restart for a fresh link.
 
 Tailscale prerequisites (one-time, in the [admin
 console](https://login.tailscale.com/admin)):
@@ -157,7 +173,7 @@ The `lan` provider is just a convenience for `--host 0.0.0.0`. You can
 still pass `--host` directly if you need full control.
 
 Keep the token secret — it's the only thing gating access when exposed.
-For `tailscale-funnel` especially: the URL is publicly reachable; the
+For `tailscale-funnel` and `cloudflared` especially: the URL is publicly reachable; the
 token is your only auth. The printed link still carries it, so share it
 deliberately — and prefer handing out a [`--share`](#share-links-that-expire)
 link, which dies on its own, over your own token, which doesn't. Once opened,
@@ -170,9 +186,10 @@ cleared when the browser session ends, or when the share expires).
 host), `start` (bring the tunnel up, return the token-free base URL; the
 server appends `?token=…` itself, once per link it prints), and `stop`
 (tear it down). All three are optional: implement only what you need, but a
-provider that spawns a long-lived process needs `stop` or it leaks past exit.
-To add e.g. a Cloudflare quick tunnel, drop a new entry into the `PROVIDERS`
-map and it becomes selectable as `--remote <name>`. No other code changes.
+provider that spawns a long-lived process needs `stop` or it leaks past exit
+(`cloudflared` is the worked example). To add one, drop a new entry into the
+`PROVIDERS` map and it becomes selectable as `--remote <name>`. No other code
+changes.
 
 ## Using the UI
 
@@ -221,7 +238,7 @@ All flags can be passed to `scripts/start.sh` or to `node server.js` directly:
 | `--share [label=]<ttl>` | —    | Mint an extra link that expires after `<ttl>` (`45s`, `30m`, `2h`, `1d`). Repeatable. See [Share links that expire](#share-links-that-expire) |
 | `--auth false`   | on          | Disable auth (local only)                     |
 | `--no-auth`      | —           | Same as `--auth false` (start.sh shorthand)   |
-| `--remote <p>`   | —           | Remote-access provider: `lan`, `tailscale-serve`, `tailscale-funnel` |
+| `--remote <p>`   | —           | Remote-access provider: `lan`, `tailscale-serve`, `tailscale-funnel`, `cloudflared` |
 | `--list`         | —           | Print available simulators and exit           |
 
 Boolean flags without values (e.g. `--foo`) are treated as `"true"`. Value
@@ -280,7 +297,8 @@ at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
 | `gallery.js`              | Screenshot gallery: file names, which files may be served, thumbnails, the page |
 | `test/gallery.test.js`    | Unit tests for it (`npm test`; no simulator needed)                  |
 | `test/shares.test.js`     | Unit tests for the registry (`npm test`; no simulator needed)        |
-| `remote.js`               | Pluggable remote-access providers (LAN / Tailscale Serve / Funnel)   |
+| `remote.js`               | Pluggable remote-access providers (LAN / Tailscale Serve / Funnel / Cloudflare quick tunnel) |
+| `test/remote.test.js`     | Unit tests for the `cloudflared` provider against a fake binary (`npm test`) |
 | `public/index.html`       | Single-page client: H.264 `<canvas>` player / MJPEG `<img>`, pointer/gesture detection, toolbar |
 | `scripts/start.sh`        | Dev launcher: checks AXe, installs deps, builds the encoder helper, boots simulator, runs server |
 | `helper/`                 | Optional Swift encoder (`npm run build:helper`): AXe raw frames → H.264; contract in `docs/architecture.md` |
@@ -349,3 +367,9 @@ Store / standalone-installer Tailscale CLI on macOS hangs talking to its
 GUI agent in some cases. The 30s is our timeout firing; the captured
 error message is still correct. For headless / scripted use, prefer
 `brew install tailscale` (non-sandboxed `tailscaled`).
+
+**`--remote cloudflared` exits with "cloudflared exited … before the tunnel
+was up"** — the lines after it are cloudflared's own output. The usual causes
+are no internet access, or a `~/.cloudflared/config.yml` left from a
+named-tunnel setup, which can stop cloudflared from starting a quick tunnel
+(move it aside for the run).

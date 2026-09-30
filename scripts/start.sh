@@ -9,6 +9,7 @@
 #   ./scripts/start.sh --remote lan              # bind to 0.0.0.0 (LAN access)
 #   ./scripts/start.sh --remote tailscale-serve  # private HTTPS over tailnet
 #   ./scripts/start.sh --remote tailscale-funnel # PUBLIC HTTPS via Funnel
+#   ./scripts/start.sh --remote cloudflared      # PUBLIC HTTPS, anonymous quick tunnel
 #   ./scripts/start.sh --share demo=2h           # also mint a link that expires (repeatable)
 #   ./scripts/start.sh --no-auth                 # disable token auth (local only!)
 # Also builds the optional H.264 encoder helper when `swift` is available.

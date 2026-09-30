@@ -20,8 +20,10 @@
 //   lan               — bind on 0.0.0.0, reachable on the local network
 //   tailscale-serve   — private HTTPS on the tailnet (auto TLS via MagicDNS)
 //   tailscale-funnel  — PUBLIC HTTPS via Tailscale Funnel
+//   cloudflared       — PUBLIC HTTPS via an anonymous Cloudflare quick tunnel
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import dns from "node:dns";
 import os from "node:os";
 
 function tailscaleBinary() {
@@ -114,6 +116,171 @@ function tailscaleProvider(mode) {
   };
 }
 
+// ---- cloudflared quick tunnel ----------------------------------------------
+//
+// `cloudflared tunnel --url …` needs no account: it asks api.trycloudflare.com
+// for a random `<words>.trycloudflare.com` hostname, prints it inside a banner
+// on stderr, then registers edge connections. The hostname does not answer
+// until the first "Registered tunnel connection" line, so start() waits for
+// both before returning — a printed link must work when it is printed.
+
+export const CLOUDFLARED_INSTALL = "brew install cloudflared";
+
+// The assigned hostname, or null. api.trycloudflare.com appears in the same
+// output (as the endpoint cloudflared asks) and must never be mistaken for it.
+export function parseQuickTunnelUrl(text) {
+  for (const m of String(text).matchAll(/https:\/\/([a-z0-9-]+)\.trycloudflare\.com(?![\w.-])/gi)) {
+    if (m[1].toLowerCase() !== "api") return `https://${m[1].toLowerCase()}.trycloudflare.com/`;
+  }
+  return null;
+}
+
+export const isTunnelError = (line) => /\bERR\b/.test(line) && !/\b(dest|originService)=/.test(line);
+
+export const isTunnelRegistered = (text) => /Registered tunnel connection/i.test(String(text));
+
+// The hostname reaches Cloudflare's DNS ~2 s after the tunnel registers
+// (measured), and a lookup that lands first is cached as NXDOMAIN for the
+// zone's 60 s negative TTL — a link opened straight from the banner would
+// fail for a minute. So start() waits for the name at trycloudflare.com's own
+// nameservers: authoritative answers are never cached, so polling them cannot
+// poison anyone's resolver. Resolves true once the name answers, false on
+// timeout or when DNS itself is unusable — never throws.
+export async function waitForAuthoritativeDns(hostname, { timeoutMs = 15_000, intervalMs = 500 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  try {
+    const zone = hostname.split(".").slice(-2).join(".");
+    const nsNames = await dns.promises.resolveNs(zone);
+    const ips = (await Promise.all(nsNames.map((n) => dns.promises.resolve4(n).catch(() => [])))).flat();
+    if (!ips.length) return false;
+    const resolver = new dns.promises.Resolver({ timeout: 2_000, tries: 1 });
+    resolver.setServers(ips);
+    while (Date.now() < deadline) {
+      try {
+        if ((await resolver.resolve4(hostname)).length) return true;
+      } catch {}
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+  } catch {}
+  return false;
+}
+
+function cloudflaredBinary(candidates) {
+  for (const p of candidates) {
+    try {
+      execFileSync(p, ["--version"], { stdio: "pipe", timeout: 10_000 });
+      return p;
+    } catch {}
+  }
+  throw new Error(`cloudflared not found. Install it with \`${CLOUDFLARED_INSTALL}\` (no account needed).`);
+}
+
+// A factory so tests can point it at a fake binary and a short timeout.
+export function cloudflaredProvider({
+  binaries = ["/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared", "cloudflared"],
+  readyTimeoutMs = 45_000,
+  stopGraceMs = 1_000,
+  waitForDns = waitForAuthoritativeDns,
+  log = (line) => console.error(`[remote:cloudflared] ${line}`),
+} = {}) {
+  let proc = null;
+  const running = (c) => c && c.exitCode === null && c.signalCode === null;
+  // Last resort for exits that skip stop() — process.exit() from a failed
+  // start, the shutdown timer, an uncaught error. A child is not killed when
+  // its parent exits, so without this the tunnel would keep serving a dead
+  // port. Synchronous, as 'exit' handlers must be.
+  const killOnExit = () => { if (running(proc)) proc.kill("SIGKILL"); };
+
+  return {
+    name: "cloudflared",
+    // The tunnel reaches the server over loopback; binding wider would only
+    // widen the attack surface.
+    prepare() {
+      return { host: "127.0.0.1" };
+    },
+    start({ port }) {
+      const bin = cloudflaredBinary(binaries);
+      return new Promise((resolve, reject) => {
+        // --grace-period: on SIGTERM cloudflared otherwise waits up to 30 s
+        // for in-flight requests — and the MJPEG stream never finishes.
+        const child = spawn(bin, [
+          "tunnel", "--no-autoupdate", "--grace-period", "1s",
+          "--url", `http://127.0.0.1:${port}`,
+        ], { stdio: ["ignore", "pipe", "pipe"] });
+        proc = child;
+        process.on("exit", killOnExit);
+
+        let output = "";
+        let url = null;
+        let settled = false;
+        const tail = () => output.trim().split("\n").slice(-8).join("\n");
+        const fail = (message) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (running(child)) child.kill("SIGKILL");
+          reject(new Error(message));
+        };
+        const timer = setTimeout(
+          () => fail(`cloudflared: no tunnel after ${Math.round(readyTimeoutMs / 1000)}s. Last output:\n${tail()}`),
+          readyTimeoutMs,
+        );
+
+        // Both streams are drained for the tunnel's whole life: cloudflared
+        // logs continuously, and a full pipe would stall it. Once the tunnel
+        // is up, only its tunnel-level error lines are echoed — an edge
+        // reconnect drops every viewer at once, and without them that is
+        // unexplained. Per-request errors (they carry `dest=` or
+        // `originService=`) are skipped: every expired share or closed tab
+        // cuts a stream mid-body and logs one.
+        const drain = () => {
+          let pending = ""; // per stream, so two streams never splice a line
+          return (chunk) => {
+            if (settled) {
+              const lines = (pending + chunk).split("\n");
+              pending = lines.pop().slice(-4_096);
+              for (const line of lines) if (isTunnelError(line)) log(line.trim());
+              return;
+            }
+            output = (output + chunk).slice(-16_384);
+            url ??= parseQuickTunnelUrl(output);
+            if (url && isTunnelRegistered(output)) {
+              settled = true;
+              clearTimeout(timer);
+              output = "";
+              const note = "PUBLIC — anyone with this URL + token can reach your simulator. " +
+                           "Anonymous quick tunnel: new hostname every run, no uptime guarantee.";
+              resolve(waitForDns(new URL(url).hostname).then((ok) => ({
+                url,
+                note: ok ? note : `${note} Its DNS name was not answering yet — if the link fails, retry in a minute.`,
+              })));
+            }
+          };
+        };
+        child.stdout.setEncoding("utf8").on("data", drain());
+        child.stderr.setEncoding("utf8").on("data", drain());
+        child.on("error", (e) => fail(`cloudflared failed to start: ${e.message}`));
+        child.on("exit", (code, signal) => {
+          process.off("exit", killOnExit);
+          if (proc === child) proc = null;
+          if (!settled) fail(`cloudflared exited (${signal || `code ${code}`}) before the tunnel was up:\n${tail()}`);
+          else if (!child.stopping) log(`tunnel exited (${signal || `code ${code}`}) — the public link is dead; restart to get a new one`);
+        });
+      });
+    },
+    async stop() {
+      const child = proc;
+      if (!running(child)) return;
+      child.stopping = true;
+      const exited = new Promise((r) => child.once("exit", r));
+      child.kill("SIGTERM");
+      const t = setTimeout(() => child.kill("SIGKILL"), stopGraceMs);
+      await exited;
+      clearTimeout(t);
+    },
+  };
+}
+
 function primaryLanIp() {
   const ifaces = os.networkInterfaces();
   // Prefer en0 (typical Wi-Fi/Ethernet on macOS); fall back to any non-loopback IPv4.
@@ -141,6 +308,7 @@ const PROVIDERS = {
   },
   "tailscale-serve": tailscaleProvider("serve"),
   "tailscale-funnel": tailscaleProvider("funnel"),
+  "cloudflared": cloudflaredProvider(),
 };
 
 export function getRemoteProvider(name) {

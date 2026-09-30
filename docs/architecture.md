@@ -21,7 +21,7 @@ process.
 | `shares.js` | The credential registry (`ShareRegistry`): the owner token plus expiring share tokens, constant-time matching, the definition of expiry, and the tracking that ends long-lived connections when a share dies. Pure — no I/O, no side effects at import, clocks injectable — so it is unit-testable without a simulator. Also exports `parseTtl` / `parseShareSpec`. |
 | `tap-label.js` | Tap by accessibility label: the viewer's text → `axe tap --label=…` / `--id=…` arguments, and AXe's failure output → the one line the error toast shows. Pure; `tapLabelArgs` / `axeErrorLine`. |
 | `gallery.js` | The screenshot gallery's rules (§ Screenshot gallery): the folder and file names, which names may be served (matched against the directory listing), the `sips` thumbnail cache, and the `/gallery` page. Import-safe; `sips` is handed in. |
-| `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`. Knows nothing about streaming or input. |
+| `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`, plus the `cloudflared` provider's pieces for tests (`cloudflaredProvider` factory, output parsers, `waitForAuthoritativeDns`). Knows nothing about streaming or input. Import-safe: nothing runs until a provider's hook is called. |
 | `public/index.html` | The entire client — markup, styles, and script in one file: the H.264 player (WebCodecs → `<canvas>`), the MJPEG `<img>` it falls back to, the input layer. Served with one templated substitution. |
 | `helper/` | **Optional** SwiftPM package: `sim-stream-encoder`, raw BGRA frames on stdin → VideoToolbox H.264 on stdout. Built by `npm run build:helper` (or by `start.sh`); nothing requires it (§ H.264 encoder helper). Its pure logic (`EncoderCore`: arguments, AXe's frame layout, output framing) has a `swift test` target. |
 | `scripts/start.sh` | Dev launcher: verifies AXe is present, installs node deps if absent, builds the encoder helper when `swift` is on PATH and the binary is missing or older than its sources (a failed build is reported and skipped, never fatal), handles `--list`, translates `--no-auth` → `--auth false`, `exec`s the server. |
@@ -40,8 +40,8 @@ process.
   shows full images.
 - **No network service on the default path.** Running the tool requires no
   account, no hosted backend, no auth provider, and no storage — it works
-  offline and air-gapped. The shipped Tailscale providers (and Cloudflare
-  later) are hosted services, but they are **opt-in per run** via `--remote`
+  offline and air-gapped. The shipped Tailscale and `cloudflared` providers
+  are hosted services, but they are **opt-in per run** via `--remote`
   and nothing depends on them otherwise. That asymmetry is load-bearing, not
   accidental — see `docs/PRD.md` § Principles and `docs/DECISIONS.md`.
 
@@ -193,11 +193,12 @@ Places designed to be extended, and the contract each one implies.
 
 - **Remote providers** (`remote.js`, the `PROVIDERS` map). **Every hook is
   optional** — the server calls each through optional chaining, so a provider
-  implements only what it needs. `lan` has just `prepare` + `start`; only the
-  Tailscale providers implement `stop`.
+  implements only what it needs. `lan` has just `prepare` + `start`; the
+  Tailscale providers and `cloudflared` implement `stop`.
   - `prepare() → {host}` — advises a bind address before `listen`. `lan`
-    advises `0.0.0.0`; the Tailscale providers advise `127.0.0.1` and tunnel to
-    it. An explicit `--host` always wins over the advice.
+    advises `0.0.0.0`; the Tailscale providers and `cloudflared` advise
+    `127.0.0.1` and tunnel to it (so an explicit `--host` that is not
+    loopback leaves the tunnel pointing at nothing). An explicit `--host` always wins over the advice.
   - `start({port}) → {url, note}` — establishes the tunnel and returns what to
     print. `url` is the **token-free base URL** (ending in `/`): providers know
     nothing about auth, and the server appends `?token=…` itself — once for the
@@ -207,6 +208,30 @@ Places designed to be extended, and the contract each one implies.
     put it here).
   - `stop()` — teardown on shutdown. **A provider that spawns a long-lived
     process must implement it** or leak that process past exit.
+
+  **`cloudflared`** is the worked example of a process-owning provider.
+  `start` spawns `cloudflared tunnel --no-autoupdate --grace-period 1s --url
+  http://127.0.0.1:<port>` and resolves only when three things have happened:
+  the random `*.trycloudflare.com` hostname appeared in its output (never
+  `api.trycloudflare.com`, which the same output mentions), a `Registered
+  tunnel connection` line followed, and the hostname answers at
+  trycloudflare.com's own nameservers. That last wait exists because the name
+  reaches DNS ~2 s after registration, and a lookup that lands first is
+  cached as NXDOMAIN for the zone's 60 s negative TTL; authoritative answers
+  are never cached, so polling them poisons no resolver. The DNS wait is
+  bounded (15 s) and never fatal — on timeout the note says to retry in a
+  minute. A missing binary, an early exit or 45 s without a registered
+  connection reject with an actionable message (the install command, or
+  cloudflared's last output lines), and kill the child first. After start,
+  both pipes are drained for the tunnel's life (a full pipe stalls it); only
+  tunnel-level `ERR` lines are echoed as `[remote:cloudflared]` — per-request
+  ones (`dest=` / `originService=`) fire on every closed tab and expired
+  share. `stop` sends SIGTERM and escalates to SIGKILL after 1 s
+  (`--grace-period` alone is not trusted: without it cloudflared waits 30 s
+  for the never-ending MJPEG response). A synchronous `process.on("exit")`
+  hook SIGKILLs the child on any exit that skipped `stop` — a failed start's
+  `process.exit(1)`, the shutdown timer. A server killed by a signal it does
+  not handle still leaks the tunnel; nothing in-process can prevent that.
 
   Adding a provider is one map entry; no other file changes.
 - **Simulator selection** (`pickSimulator`). Also hand-maintained: with no
@@ -448,8 +473,10 @@ Deliberate, and worth knowing before "fixing" them:
   before `/api/info` returns, avoiding a layout flash. This is the only
   templating; don't grow it into a template engine.
 - **The MJPEG response sets `X-Accel-Buffering: no` and `Connection: close`.**
-  Proxies that buffer a `multipart/x-mixed-replace` body break the stream —
-  relevant to any future CDN-fronted provider.
+  Proxies that buffer a `multipart/x-mixed-replace` body break the stream.
+  Cloudflare's edge does not buffer it (measured through a quick tunnel:
+  same ~7 fps and inter-frame gaps as `localhost`, first frame ~0.4–0.8 s),
+  and the `/video` and `/ws` WebSockets pass through unchanged.
 - **The client recovers on its own.** The WebSocket retries with exponential
   backoff from 1500 ms; close codes `1006` and `1008` are read as auth failure
   and surface a single toast rather than a retry storm. The MJPEG `<img>` is
@@ -474,7 +501,7 @@ parsing, AXe's frame layout (pinned to measured frame sizes), and the output
 framing. The VideoToolbox path itself is verified by piping a live AXe stream
 through the binary (§ H.264 encoder helper, *Measured*).
 
-**`npm test`** (`node --test`, no dependencies) covers the four modules that
+**`npm test`** (`node --test`, no dependencies) covers the five modules that
 need no simulator. `shares.js` — TTL and `--share` parsing, token matching,
 the expiry boundary, the two-clock and latch rules, session tracking, and the
 expiry timer. Anything that changes how a token is accepted or when it dies
@@ -492,7 +519,14 @@ one generation for concurrent requests, clean failure) and the page's
 escaping. Serving rules fail open silently, so a change to them belongs there
 first. `tap-label.js` — `#` → `--id`, trimming, dash-leading labels kept as
 one `--flag=value` argument, empty/over-long input, and AXe's real no-match
-and multiple-match output reduced to the toast line.
+and multiple-match output reduced to the toast line. `remote.js`'s
+`cloudflared` provider — driven against `test/fixtures/fake-cloudflared`
+(extensionless, so `node --test` never runs it), which replays cloudflared's
+real banner, splits the hostname across writes and checks the exact argv:
+hostname parsing (not `api.`, not a suffix match), resolving only after
+registration, the ready timeout, an early exit, the missing-binary message,
+SIGKILL escalation, the dead-tunnel log line and the `ERR` filter. No
+network: the DNS wait is injected.
 
 Everything else has **no automated coverage**, and the reason is structural:
 every other meaningful path requires a booted iOS Simulator plus the AXe binary
@@ -511,7 +545,12 @@ phase gate is a browser session:
    and status recovers.
 5. Narrow the viewport below 720 px — confirm the bottom sheet behaves.
 6. If touching `remote.js`, verify at least the `lan` provider end-to-end from
-   a second device.
+   a second device. If touching `cloudflared`: start with `--remote
+   cloudflared --share short=2m`, open the printed link at once (it must
+   load — no DNS failure), confirm `/stream` runs at the `localhost` frame
+   rate and `/video` at ~30 fps through the tunnel, that the share's streams
+   end at its deadline (`1008 share expired`) and its link then answers
+   `401`, and after Ctrl-C that `pgrep cloudflared` finds nothing.
 7. If touching auth, start with a short share (`--share 30s`), open its link,
    and wait: at the deadline the page must show "This share link has expired",
    the server must log the share's expiry with the number of connections it
@@ -538,6 +577,6 @@ phase gate is a browser session:
     and an unauthenticated `…/gallery/file/%E0%A4%A.png` a plain-text `400`.
 
 The rest of what *can* be unit-tested without a simulator — `parseArgs`, `pt()`
-clamping, `boundsForDeviceType`, provider selection — still lives in
-`server.js`/`remote.js`, which run side effects at import. Covering them means
+clamping, `boundsForDeviceType` — still lives in `server.js`, which runs side
+effects at import. Covering them means
 moving them behind an import-safe module first, as `shares.js` was.

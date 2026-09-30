@@ -260,3 +260,21 @@ screen transition (hence a 15 s timeout for label taps). Verified on the run's
 sandbox clone — over `/ws` (match, no match, several matches, `#id` miss, blank,
 `-x`) and in Chrome (Settings → General → About by label; error toast).
 `npm test` 87/87 (10 new in `test/tap-label.test.js`).
+
+## 2026-09-30 — 6.1 (`cloudflared` quick tunnel)
+
+`--remote cloudflared` opens an anonymous `*.trycloudflare.com` tunnel: no
+account, the binary is the only prerequisite (missing → exits with `brew install
+cloudflared`). The link prints only once the tunnel registered and its DNS name
+answers at the authoritative nameservers — found live: a link opened ~2 s too
+early is NXDOMAIN-cached for 60 s. `stop` escalates SIGTERM → SIGKILL and an
+exit hook kills the child on paths that skip `stop`. Verified through real
+tunnels to the run's sandbox clone (owner-authorized): MJPEG not buffered at the
+edge (7.2 fps both sides), `/video` 31 fps with every record decoding, a 150 s
+`--share` ended both streams at its deadline (`1008 share expired`, then `401`),
+and on the QA bench iPhone (primary) Safari showed `H.264` and taps landed.
+Gotchas: one run dropped every tunnel connection at once after ~111 s with no
+log line — hence tunnel-level `ERR` lines are now echoed; an unauthenticated
+`wss` upgrade reached the `ws` client as `500` though curl sees the `401`
+(browsers get `1006` either way). The `lan` re-check ran from the host only —
+the bench iPhone had locked. `npm test` 99/99 (12 new in `test/remote.test.js`).

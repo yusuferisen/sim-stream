@@ -623,3 +623,31 @@ Choices made while building the `tap-label` input event; all reversible.
   itself starts with `#`; use a coordinate tap for that rare case.
 - **Error toasts stay up in proportion to their length** (45 ms per
   character, 2.5–8 s) — AXe's multiple-match message is ~190 characters.
+
+---
+
+## 2026-09-30 — `cloudflared` provider mechanics (6.1)
+
+**Chose:** the quick-tunnel link is printed only after cloudflared registers a
+connection **and** the hostname answers at trycloudflare.com's authoritative
+nameservers; the DNS wait is bounded (15 s) and never fatal.
+**Why:** measured — the name reaches DNS ~2 s after registration, and a link
+opened sooner gets NXDOMAIN cached for the zone's 60 s negative TTL, so the
+first viewer sees "server not found" for a minute. Polling the authoritative
+servers caches nothing anywhere. **Rejected:** a fixed sleep (guesses the lag);
+polling the system resolver (would poison the host's own cache — observed).
+
+**Chose:** echo only tunnel-level `ERR` lines after start; skip per-request ones
+(`dest=` / `originService=`). **Why:** every expired share and closed tab cuts a
+stream mid-body and cloudflared logs an `unexpected EOF` for it — noise. A
+tunnel-level error is the one explanation for every viewer dropping at once,
+which was seen once on a real tunnel.
+
+**Chose:** `stop` = SIGTERM, SIGKILL after 1 s, plus `--grace-period 1s`, plus a
+synchronous exit hook. **Why:** cloudflared's default 30 s grace waits for
+in-flight requests, and the MJPEG response never ends; the exit hook covers the
+`process.exit` paths that skip `stop`.
+
+**Settled by measurement:** Cloudflare's edge does **not** buffer MJPEG (same
+frame rate and gaps as `localhost`), so the README recommends the quick tunnel
+as an equal public route beside Funnel — no caveat needed.
