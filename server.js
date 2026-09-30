@@ -618,7 +618,9 @@ async function dispatchInput(queue, bounds, evt) {
   switch (evt.type) {
     case "tap": {
       const p = pt(evt.x, evt.y);
-      await queue.push(["tap", "-x", String(p.x), "-y", String(p.y)]);
+      // `physical` = a touch down/up pair. AXe's default for a coordinate tap
+      // (FBSimulator tapAt) acks but lands nowhere on iOS 27 simulators.
+      await queue.push(["tap", "-x", String(p.x), "-y", String(p.y), "--tap-style", "physical"]);
       return;
     }
     case "long-press": {
