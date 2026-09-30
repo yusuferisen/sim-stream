@@ -5,8 +5,8 @@
 > the live checklist and all completion truth live in `PROGRESS.md`.
 >
 > Shipped phases (1–5: core streaming, mobile UI, remote providers, the
-> build-vs-adopt evaluation, token & session hardening) have been pruned from
-> here. Their narrative is in
+> build-vs-adopt evaluation, token & session hardening; 7: the 30 fps H.264
+> capture pipeline and browser player) have been pruned from here. Their narrative is in
 > `docs/JOURNAL.md`, their rationale in `docs/DECISIONS.md`, and the system as
 > built is described in `docs/OVERVIEW.md`.
 
@@ -31,7 +31,9 @@ which would surface as a stalled first frame or visible stutter. Verify against
 a real tunnel; if it buffers, say so in the README rather than quietly shipping
 a worse path than Tailscale. On the same tunnel, confirm that a short `--share`
 link still cuts the stream at its deadline — expiry has to hold through the
-edge, not just on the LAN.
+edge, not just on the LAN. The tunnel is also the first https route to a
+real iPhone, so check the H.264 player there too: the header should read
+`H.264` in iPhone Safari and taps should still land.
 
 **Out of scope.** Installing `cloudflared` — treat a missing binary the way
 `start.sh` already treats a missing `axe`: fail immediately with the install
@@ -72,100 +74,13 @@ an *opt-in per-share choice* and never as the default path.
 
 ---
 
-## Phase 7 — Capture pipeline (AXe raw frames → H.264 → WebCodecs)
+## Unscheduled — 30 fps on plain-http LAN
 
-**The ceiling, re-measured.** The ~7–10 fps limit is real, but it is not a
-capture limit: AXe's `mjpeg` mode is slow, while its raw `bgra` mode delivers
-a steady ~30 fps from the same simulator — headless, with no Screen Recording
-permission, and pixel-exact (`DECISIONS.md § Phase 7 capture source`). What is
-missing is an encoder and a transport that can carry 30 fps without 30 JPEGs a
-second. ~8 fps is adequate for "did the button land in the right place" and
-inadequate for anything about motion — animation review, scroll feel, gesture
-responsiveness.
-
-**Scope, in three slices.**
-
-- **7.1 — Swift encoder helper.** A small SwiftPM executable under `helper/`
-  that reads raw BGRA frames on stdin (dimensions and rate passed as
-  arguments), hardware-encodes H.264 with VideoToolbox, and writes one framed
-  access unit per frame on stdout. Low-latency settings: real-time, no frame
-  reordering, a keyframe every second, parameter sets repeated with every
-  keyframe so a stream can be joined at any keyframe. It stands alone: piping
-  `axe stream-video --format bgra` through it into a file must give a stream
-  `ffprobe` reads at ≥25 fps. It carries its own `swift test` target for the
-  argument and framing logic, and an `npm run build:helper` script that builds
-  it. It also writes the helper's command line and stdout framing into
-  `docs/architecture.md`: 7.2 is built in a separate session and must work
-  from that written contract, not from reading the Swift. `server.js` and
-  `start.sh` are not touched in this slice.
-- **7.2 — H.264 hub and `/video` WebSocket.** A second hub beside `MjpegHub`
-  with the same invariants — refcount with the 5 s grace window, the generation
-  guard, status broadcast — that spawns AXe and the helper, caches the current
-  group of pictures so a joining viewer starts on a keyframe at once, and
-  sends access units as binary WebSocket messages. A viewer that falls behind
-  is skipped forward to the next keyframe rather than buffered without bound.
-  `/video` authenticates through `requestAuthorized()` and registers with
-  `ShareRegistry.track()`, exactly like `/stream` and `/ws`. `/api/info` and
-  the `hello` frame advertise whether H.264 is available (helper built) and
-  its dimensions. The parser, cache and drop logic live in an import-safe
-  module with `node:test` coverage. This slice also owns the wiring 7.1 left
-  alone: `start.sh` builds the helper when `swift` is on PATH, and the server
-  checks for the built binary at startup and logs which path it will serve.
-  MJPEG is untouched. **Done when** a scripted WebSocket client saves 5 s of
-  `/video` that `ffprobe` reads at ≥25 fps, an unauthenticated upgrade is
-  refused with `401`, and a `--share 30s` connection is closed at its
-  deadline with `1008 share expired`.
-- **7.3 — Browser player with fallback.** On a secure context with
-  `VideoDecoder` available and H.264 advertised, the client decodes to a
-  `<canvas>`; everywhere else — plain-http LAN, no helper built, an old
-  browser, a decoder error — it keeps the MJPEG `<img>` exactly as today. The
-  header shows which path is live. Gesture detection and the normalized
-  coordinate mapping must behave identically on both surfaces.
-
-**Explicitly not.**
-
-- **ScreenCaptureKit.** It captures a visible Simulator.app window; this host
-  runs its simulators headless, so there is nothing to capture. It would also
-  need a Screen Recording grant and bezel cropping. Its only gain is 60 fps
-  over 30 — revisit as a lettered phase if 30 fps ever proves too little.
-- **WebRTC.** Its media cannot cross the HTTP-only tunnels the `--remote`
-  providers use (Funnel, Cloudflare, ngrok) without a hosted relay, and it
-  brings a large library into a two-dependency project.
-- **Removing MJPEG.** It stays as the zero-build, works-anywhere default.
-- LiveKit, Supabase, or any hosted service (`DECISIONS.md § Build vs. adopt`).
-- A required build step. `npm i && node server.js` must still reach a first
-  frame with no helper built; the helper is an upgrade, not a prerequisite.
-
-**Watch for.**
-
-- The raw stream is ~95 MB/s at the default scale and ~380 MB/s at full scale.
-  Hand AXe's stdout to the helper as a file descriptor; never pump it through
-  Node.
-- Raw BGRA has no header, and the server knows logical points
-  (`boundsForDeviceType`), not pixels. Take the device's pixel size from a
-  screenshot's PNG header and apply the scale with AXe's rounding (measured:
-  1206×2622 → 603×1311 at 0.5). Never hardcode it, and never derive it from
-  the bounds table — a wrong size is garbled video.
-- Scale 0.5 yields odd frame dimensions (603×1311). H.264 4:2:0 wants even
-  ones — pad or crop in the helper, and make sure the client's coordinate
-  mapping still covers exactly the device screen.
-- `/video` is a new long-lived entry point. Without the auth check it is a
-  hole; without `track()` it outlives its share link. Close codes keep their
-  meaning: `1008` with `share expired` is final, other `1006`/`1008` are a bad
-  credential.
-- Two hubs can run two AXe capture processes at once if one viewer is on MJPEG
-  and another on H.264. Acceptable; don't build a shared-capture layer for it.
-- Taps measured 3.0–3.5 s with the 30 fps capture running, against a 5 s queue
-  timeout. Re-measure in 7.3. Input correctness outranks smoothness (PRD
-  principle 5): lower the capture rate before loosening the queue.
-- A real-iPhone check of the H.264 path needs an https route; the Phase 6
-  quick tunnel is the account-free one.
-
-**Later idea, not scheduled.** Plain-http LAN links stay on ~8 fps MJPEG under
-this plan. The same helper could emit JPEGs instead of H.264 and feed the
-existing MJPEG path at 30 fps, closing that gap with no browser changes. It
-costs roughly 25 Mbit/s, so it suits the LAN and nothing else. If LAN
-smoothness turns out to matter, add it as a lettered phase.
+Plain-http links (`--remote lan`) stay on ~8 fps MJPEG, because browsers decode
+H.264 only on secure contexts. The encoder helper could emit JPEGs instead of
+H.264 and feed the existing MJPEG path at 30 fps, closing that gap with no
+browser changes. It costs roughly 25 Mbit/s, so it suits the LAN and nothing
+else. If LAN smoothness turns out to matter, add it as a lettered phase.
 
 ---
 

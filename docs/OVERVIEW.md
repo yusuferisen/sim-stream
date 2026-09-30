@@ -14,7 +14,8 @@ for an httpOnly cookie on first load). Links minted for other people expire on
 their own.
 There is no account, no hosted backend, and no required build step — `npm i &&
 node server.js`. An optional Swift helper adds a 30 fps H.264 stream beside the
-MJPEG one; the page itself still shows MJPEG. Reaching it from outside the machine is opt-in: `--remote` selects
+MJPEG one, which the page plays wherever the browser can decode it (https or
+`localhost`) and falls back from on its own. Reaching it from outside the machine is opt-in: `--remote` selects
 a provider (Tailscale today), and that is the only point at which anything
 leaves the host.
 
@@ -23,7 +24,8 @@ leaves the host.
 ```mermaid
 flowchart TB
     subgraph browser["Browser (any device)"]
-        img["&lt;img src=/stream&gt;<br/>native MJPEG decode"]
+        player["&lt;canvas&gt; H.264 player<br/>WebCodecs · secure contexts"]
+        img["&lt;img src=/stream&gt;<br/>MJPEG — the fallback"]
         ptr["Pointer / gesture layer<br/>tap · swipe · long-press"]
         ctl["Controls panel<br/>keyboard · hw buttons · paste"]
     end
@@ -50,7 +52,9 @@ flowchart TB
     auth -- "match token" --> reg
     auth --> hub
     auth --> vhub
-    script -- "WS /video — H.264 records" --> auth
+    player -- "WS /video — H.264 records" --> auth
+    player -. "any failure: switch once" .-> img
+    script -- "WS /video" --> auth
     auth --> queue
     auth --> info
     reg -. "on expiry: end that share's /stream, /ws + /video" .-> auth
@@ -150,6 +154,16 @@ in one command rather than keystroke-by-keystroke.
 buttons in the panel. The ▲/▼/←/→ controls send preset swipes from the center
 of the screen.
 
+**See the screen at 30 fps.** When the encoder helper is built and the page is
+on https or `localhost`, it plays `/video` — decoded by the browser's WebCodecs
+into a canvas — and the header reads **H.264**. Anywhere else (plain-http
+`--remote lan`, no helper, a browser without WebCodecs) it shows the MJPEG
+stream and the header reads **MJPEG**; hover it for the reason. If the H.264
+stream fails mid-session — the decoder errors, the capture dies, no frame for a
+few seconds — the page switches to MJPEG once and stays there until reloaded.
+Taps, swipes and long-presses land the same way on either. A hidden tab lets go
+of `/video` and rejoins when shown.
+
 **Pull a 30 fps H.264 stream from a script.** When the encoder helper is built
 (`./scripts/start.sh` builds it if `swift` is available; `npm run build:helper`
 does it by hand), the server also offers `/video`: a WebSocket that sends a
@@ -174,18 +188,18 @@ so they can be chained.
 
 Known and accepted, not defects:
 
-- **~7–10 fps in the browser.** That is what AXe's MJPEG mode delivers, so for
-  the page the `--fps` flag is an upper bound it won't reach. Fine for
-  verifying layout and placement; not enough for judging animation or scroll
-  feel. The 30 fps H.264 stream exists on `/video`, but the page does not play
-  it.
+- **~7–10 fps on the MJPEG fallback.** That is what AXe's MJPEG mode
+  delivers, so there the `--fps` flag is an upper bound it won't reach — which
+  includes every plain-http `--remote lan` link, since browsers decode H.264
+  only on https or `localhost`.
 - **US keyboard only.** AXe's `type` uses HID keycodes — no accented or
   non-ASCII characters.
 - **Single touch.** No pinch, no rotate, no multi-finger gestures.
 - **One simulator per server.** The UDID is fixed at startup.
 - **No stream heartbeat beyond start/stop.** If the AXe process *hangs* rather
   than exits, the status dot can stay green until something eventually throws.
-  The same holds for the H.264 pipeline: its status stays `live`.
+  The H.264 pipeline's status stays `live` too, but the page notices the
+  missing frames and falls back to MJPEG.
 - **Shares can't be extended, revoked one at a time, or minted while
   running.** They are fixed at startup; the only revocation is restarting the
   server, which kills every link including the operator's own.

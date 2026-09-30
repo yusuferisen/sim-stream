@@ -541,3 +541,34 @@ Choices made while building the hub and `/video`; all reversible.
   request threw out of the handler (no credential needed), and a protocol-
   invalid frame on `/ws` was an unhandled `error` event. Both killed the
   process. Now an invariant in `docs/architecture.md`.
+
+---
+
+## 2026-09-30 — Browser player mechanics (7.3)
+
+Choices made while building the page's H.264 player; all reversible.
+
+- **One H.264 attempt per page load; any failure means MJPEG until reload.**
+  Decoder refusal or error, a malformed record, the `/video` socket closing
+  (refused, `1011`, `1013`), no frame for 8 s after connecting or 4 s after the
+  first. *Rejected:* retrying H.264 with backoff — every connect after a
+  pipeline death respawns AXe and the encoder, and a page that flips between
+  surfaces is worse than a steady slow one; running MJPEG alongside while H.264
+  starts — two capture processes cost tap latency (PRD principle 5, input
+  over smoothness) for a blank second saved.
+- **A hidden tab closes `/video` and rejoins when shown**; a page opened in the
+  background waits. Saves the 30 fps capture while nobody watches and sidesteps
+  browsers reclaiming background decoders (which would otherwise force the
+  MJPEG fallback). *Rejected:* keeping the socket open while hidden.
+- **The header label names the live path** (`H.264` / `MJPEG`) and its tooltip
+  gives the reason for a fallback — no toast, since falling back is normal on
+  plain-http links.
+- **The canvas is stretched over the device-aspect wrap** (`object-fit: fill`),
+  so the even-cropped picture maps onto the whole screen and the shared overlay
+  needs no per-surface math.
+- **Coordinate taps use `axe tap --tap-style physical`.** Found while verifying
+  that taps still land: AXe 1.8.0's default for a coordinate tap
+  (FBSimulator `tapAt`) acks but does nothing on iOS 27 simulators, directly
+  from the CLI as well; the touch down/up style lands. Swipes and long-presses
+  already use touch events. *Cost:* an AXe too old to know `--tap-style`
+  fails every tap with its own error rather than silently.

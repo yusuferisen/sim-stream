@@ -20,7 +20,7 @@ process.
 | `h264.js` | The H.264 path's logic (§ H.264 video path): the capture plan, the helper-record parser, the group-of-pictures cache, and `H264Hub` — refcount, grace window, generation guard and per-viewer delivery. Pure, like `shares.js`: the pipeline, the sockets, the clock and the timers are handed in, so it is unit-testable without a simulator. |
 | `shares.js` | The credential registry (`ShareRegistry`): the owner token plus expiring share tokens, constant-time matching, the definition of expiry, and the tracking that ends long-lived connections when a share dies. Pure — no I/O, no side effects at import, clocks injectable — so it is unit-testable without a simulator. Also exports `parseTtl` / `parseShareSpec`. |
 | `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`. Knows nothing about streaming or input. |
-| `public/index.html` | The entire client — markup, styles, and script in one file. Served with one templated substitution. |
+| `public/index.html` | The entire client — markup, styles, and script in one file: the H.264 player (WebCodecs → `<canvas>`), the MJPEG `<img>` it falls back to, the input layer. Served with one templated substitution. |
 | `helper/` | **Optional** SwiftPM package: `sim-stream-encoder`, raw BGRA frames on stdin → VideoToolbox H.264 on stdout. Built by `npm run build:helper` (or by `start.sh`); nothing requires it (§ H.264 encoder helper). Its pure logic (`EncoderCore`: arguments, AXe's frame layout, output framing) has a `swift test` target. |
 | `scripts/start.sh` | Dev launcher: verifies AXe is present, installs node deps if absent, builds the encoder helper when `swift` is on PATH and the binary is missing or older than its sources (a failed build is reported and skipped, never fatal), handles `--list`, translates `--no-auth` → `--auth false`, `exec`s the server. |
 | `scripts/video-probe.js` | Verification tool: a scripted `/video` client that reports what arrived (record and keyframe counts, frame rate, close code) and can save the stream for `ffprobe`. Not used by the server. |
@@ -55,8 +55,8 @@ Independent channels, deliberately not multiplexed:
    encoder helper is built. `H264Hub` spawns `axe stream-video --format bgra`
    with its stdout handed straight to `sim-stream-encoder`, parses the
    helper's records, and sends each as one binary message (§ H.264 video
-   path). The page does not use it yet — it is an endpoint for scripts until
-   the browser player exists.
+   path). The page plays it when it can (§ Browser player); scripts use it
+   too.
 3. **Input, browser → server.** `WS /ws` carries JSON events. Each is parsed,
    passed to `dispatchInput()`, and acked as `{type:"ack", id}` or
    `{type:"error", id, message}`.
@@ -198,7 +198,9 @@ Places designed to be extended, and the contract each one implies.
   iPad-only host cannot start the server at all. Widening platform support
   starts here, not in the bounds table.
 - **Input events** (`dispatchInput`'s switch). Cases: `tap`, `long-press`,
-  `swipe`, `type`, `key`, `button`. Unknown types throw, which surfaces as a
+  `swipe`, `type`, `key`, `button`. A coordinate `tap` is sent to AXe with
+  `--tap-style physical` (a touch down/up pair): its default style acks but
+  lands nowhere on iOS 27 simulators. Unknown types throw, which surfaces as a
   `{type:"error"}` ack rather than a silent no-op. Adding an event type means
   adding a case and a client sender.
 - **Hardware buttons.** Gated by an explicit `allowed` list
@@ -347,6 +349,43 @@ a byte stream with no markers cannot be resynchronised. The group-of-pictures
 cache empties itself if keyframes stop coming (150 frames / 32 MiB) rather
 than grow.
 
+## Browser player (`public/index.html`)
+
+**Which surface.** The page picks once, after `/api/info`: H.264 when
+`h264.available`, `window.isSecureContext` and WebCodecs' `VideoDecoder` are
+all present; the MJPEG `<img>` otherwise. The header label says which
+(`H.264` / `MJPEG`), with the reason as its tooltip.
+
+**One attempt, then MJPEG for good.** Every H.264 failure switches the page to
+MJPEG for the rest of its life: `configure()` or `decode()` throwing, the
+decoder's error callback, a record whose length disagrees with its message,
+the `/video` socket closing for any reason (a refused upgrade, `1011`,
+`1013`), no decoded frame within 8 s of connecting or for 4 s after the first.
+There is no H.264 reconnect loop — each connect after a pipeline death
+respawns AXe and the encoder. The one exception is `1008 share expired`, on
+`/video` or `/ws`: final, so neither path is tried again.
+
+**A hidden tab lets go of `/video`** and reconnects when shown (inside the
+server's grace window this reuses the running pipeline and starts on its
+cached keyframe). A page opened in a background tab waits until shown. This
+also keeps browsers from reclaiming a background decoder, which would read as
+a failure.
+
+**Decoding.** The `config` message configures the decoder (`codec`,
+`codedWidth/Height`, `optimizeForLatency`; no `description` — Annex B carries
+SPS/PPS in-band). Each binary message becomes one `EncodedVideoChunk` (key
+flag and µs timestamp from the header, the payload after byte 16). Deltas are
+dropped until a keyframe whenever one is owed — at the start, or when the
+decoder has fallen more than ~1 s behind. Frames are drawn as they are
+decoded, with no pacing buffer.
+
+**Same input on both surfaces.** The canvas and the `<img>` both fill
+`#screen-wrap` (the device's aspect ratio) beneath the same `#overlay`, which
+alone takes pointer events and normalizes coordinates against its own box.
+The canvas is stretched (`object-fit: fill`) rather than letterboxed, so the
+decoded picture — even-sized, at most a source pixel short — covers exactly
+the screen the coordinates describe.
+
 ## Notable asymmetries
 
 Deliberate, and worth knowing before "fixing" them:
@@ -366,7 +405,8 @@ Deliberate, and worth knowing before "fixing" them:
   backoff from 1500 ms; close codes `1006` and `1008` are read as auth failure
   and surface a single toast rather than a retry storm. The MJPEG `<img>` is
   kicked to force a reconnect, which is what makes the server respawn AXe.
-  The upgrade handler rejects with a raw `401` and destroys the socket, which
+  The H.264 player is the deliberate opposite: it never reconnects after a
+  failure, it falls back to MJPEG (§ Browser player). The upgrade handler rejects with a raw `401` and destroys the socket, which
   the browser surfaces as `1006`. Anything that changes how credentials are
   carried must keep `1006`/`1008` meaning
   "your credential is bad" — it is the client's only auth feedback channel.
@@ -427,6 +467,12 @@ phase gate is a browser session:
    and `--seconds 0` it must end with close `1008 share expired`. Two probes
    inside 5 s must log a single `[h264] spawn`. Then move the helper binary
    aside and confirm the server starts MJPEG-only and `/video` answers `404`.
+9. If touching the browser player: on `localhost` the header must read
+   `H.264` and taps must land and ack well inside the 5 s queue timeout; kill
+   the encoder (`pkill -f 'sim-stream-encoder --source'`) and the page must
+   switch to `MJPEG` once, with a single `[video] connected` in the log;
+   freeze it (`pkill -STOP …`) and it must switch within ~5 s. Open the
+   `--remote lan` URL (plain http) and it must show `MJPEG` from the start.
 
 The rest of what *can* be unit-tested without a simulator — `parseArgs`, `pt()`
 clamping, `boundsForDeviceType`, provider selection — still lives in

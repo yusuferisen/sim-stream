@@ -35,9 +35,11 @@ decisions, and history live in [`docs/`](docs/).
 
 - macOS with Xcode + iOS Simulator installed (`xcrun simctl` available)
 - [AXe CLI](https://github.com/cameroncooke/AXe) — `brew install cameroncooke/axe/axe`
+  (a version whose `axe tap` knows `--tap-style`; 1.8.0 does)
 - Node.js 18+ (uses ESM, top-level `crypto.timingSafeEqual`, `EventEmitter`)
 - Optional: the Swift toolchain that ships with Xcode, to build the H.264
-  encoder helper (30 fps video on `/video`). Without it everything else works.
+  encoder helper (30 fps video in the page on https/`localhost`, and on
+  `/video`). Without it the page shows MJPEG and everything else works.
 
 ## Install
 
@@ -235,8 +237,10 @@ a third for scripts:
    30 fps H.264, one frame per binary message, when the encoder helper is
    built: the server pipes `axe stream-video --format bgra` into
    `sim-stream-encoder` (VideoToolbox) and fans the result out. It uses the
-   same token / cookie / header as everything else. The web page does not
-   play it yet; try it with
+   same token / cookie / header as everything else. The page plays it with
+   WebCodecs into a `<canvas>` on secure contexts (https, `localhost`) and
+   falls back to the MJPEG `<img>` everywhere else or on any failure; the
+   header says which is live. From a script:
    `node scripts/video-probe.js --token <TOKEN> --seconds 5 --out clip.h264`.
    The message format is in `docs/architecture.md` § H.264 video path.
 
@@ -259,15 +263,16 @@ at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
 | `shares.js`               | The token registry: your token plus expiring share tokens            |
 | `test/shares.test.js`     | Unit tests for the registry (`npm test`; no simulator needed)        |
 | `remote.js`               | Pluggable remote-access providers (LAN / Tailscale Serve / Funnel)   |
-| `public/index.html`       | Single-page client: MJPEG `<img>`, pointer/gesture detection, toolbar |
+| `public/index.html`       | Single-page client: H.264 `<canvas>` player / MJPEG `<img>`, pointer/gesture detection, toolbar |
 | `scripts/start.sh`        | Dev launcher: checks AXe, installs deps, builds the encoder helper, boots simulator, runs server |
 | `helper/`                 | Optional Swift encoder (`npm run build:helper`): AXe raw frames → H.264; contract in `docs/architecture.md` |
 
 ## Limitations
 
-- **The page shows ~7–10 fps.** That is the ceiling of AXe's MJPEG mode,
-  which the browser view uses, whatever `--fps` asks for. The 30 fps H.264
-  stream on `/video` is there for scripts; the page does not play it yet.
+- **MJPEG runs at ~7–10 fps.** That is the ceiling of AXe's MJPEG mode,
+  whatever `--fps` asks for. The page gets 30 fps only on the H.264 path,
+  which needs the encoder helper and an https or `localhost` URL — a
+  plain-http `--remote lan` link always shows MJPEG.
 - **`--scale 1.0` is very heavy.** At full scale AXe's MJPEG mode sends
   ~3.6 MB PNG frames — roughly 30 MB/s. Stay at the default `0.5` unless
   you're on the same machine.
@@ -305,6 +310,12 @@ Restart with a fresh `--share` to issue a new one.
 (`npm run build:helper`; needs the Swift toolchain from Xcode), or the server
 could not take the startup screenshot it measures the screen with. The reason
 is on that line. Everything except `/video` works without it.
+
+**Header says `MJPEG` although the helper is built** — hover it for the
+reason. Plain http other than `localhost` (e.g. `--remote lan`) cannot decode
+H.264 in the browser; otherwise the H.264 stream failed once (decoder error,
+capture ended, no frames) and the page switched for the rest of its life —
+reload to try H.264 again.
 
 **Stream freezes after a while** — the underlying AXe process likely
 crashed. Reload the page; the server will respawn it on the next connect.

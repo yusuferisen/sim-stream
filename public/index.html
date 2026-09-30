@@ -46,7 +46,7 @@
     height: 100%;
     display: flex;
   }
-  #screen {
+  #screen, #screen-canvas {
     width: 100%; height: 100%;
     display: block;
     object-fit: contain;
@@ -55,6 +55,11 @@
     -webkit-user-drag: none;
     pointer-events: none;
   }
+  /* The decoded H.264 picture drops an odd last row/column, so it is
+     stretched over the whole wrap (which has the device's aspect) rather than
+     letterboxed: the overlay's 0..1 mapping then covers exactly the screen. */
+  #screen-canvas { object-fit: fill; }
+  #screen[hidden], #screen-canvas[hidden] { display: none; }
   #overlay {
     position: absolute; inset: 0;
     cursor: crosshair;
@@ -246,13 +251,14 @@
     <div class="title">sim-stream</div>
     <div class="meta" id="meta">—</div>
     <div class="spacer"></div>
-    <div class="status"><span class="dot" id="stream-dot"></span> stream</div>
+    <div class="status" id="stream-status"><span class="dot" id="stream-dot"></span> <span id="stream-kind">stream</span></div>
     <div class="status"><span class="dot" id="ws-dot"></span> input</div>
   </header>
   <main>
     <div id="stage">
       <div id="screen-wrap">
         <img id="screen" alt="simulator" draggable="false" />
+        <canvas id="screen-canvas" aria-label="simulator" hidden></canvas>
         <div id="overlay"></div>
       </div>
     </div>
@@ -341,24 +347,209 @@
   }
 
   // -----------------------------------------------------------------------
-  // Load simulator info from server, THEN start the stream. This avoids an
+  // Load simulator info from server, THEN start the video. This avoids an
   // aspect-ratio flash because the server also inlines the real aspect into
-  // the page template — but we still defer setting src so the img doesn't
-  // begin before we know the device info.
+  // the page template — but we still defer the video so it doesn't begin
+  // before we know the device info and which video path the server offers.
   // -----------------------------------------------------------------------
   fetch("/api/info").then((r) => r.json()).then((info) => {
     const sim = info.simulator || {};
     metaLabel.textContent = `${sim.name || "?"} • ${sim.runtime || ""}`;
     simInfo.textContent = `${sim.name}\n${sim.runtime}\nudid: ${sim.udid?.slice(0, 8)}…`;
     if (info.bounds && info.bounds.w) bounds = info.bounds;
-    screen.src = "/stream";
+    startVideo(info.h264);
   }).catch((e) => {
     console.error(e);
     toast("Could not load simulator info — check auth token", "bad");
   });
 
-  screen.onload = () => { streamDot.classList.add("ok"); streamDot.classList.remove("bad"); };
-  screen.onerror = () => { streamDot.classList.remove("ok"); streamDot.classList.add("bad"); };
+  function setStreamDot(ok) {
+    streamDot.classList.toggle("ok", ok === true);
+    streamDot.classList.toggle("bad", ok === false);
+  }
+  screen.onload = () => setStreamDot(true);
+  screen.onerror = () => setStreamDot(false);
+
+  // -----------------------------------------------------------------------
+  // Video: H.264 (/video → WebCodecs → <canvas>) when the server offers it
+  // and this page can decode it; the MJPEG <img> (/stream) otherwise.
+  // Wire format: docs/architecture.md § H.264 video path.
+  //
+  // One H.264 attempt per page load. Anything that goes wrong with it — the
+  // decoder refuses the codec, a decode error, the socket closes (1011
+  // capture ended, 1013 too slow, a refused upgrade), no frame within a few
+  // seconds — switches to MJPEG for the rest of the page's life. Never a
+  // reconnect loop: each /video connect after a pipeline death respawns AXe
+  // and the encoder. Both surfaces fill #screen-wrap, under the same
+  // #overlay, so input mapping does not depend on which one is live.
+  // -----------------------------------------------------------------------
+  const canvas = $("screen-canvas");
+  const ctx2d = canvas.getContext("2d", { alpha: false, desynchronized: true });
+  const streamKind = $("stream-kind");
+  const streamStatus = $("stream-status");
+  const H264_FIRST_FRAME_MS = 8000; // connect → first decoded frame (includes spawning AXe + encoder)
+  const H264_STALL_MS = 4000;       // the pipeline has no heartbeat; 30 fps means silence is a hang
+  const H264_MAX_DECODE_QUEUE = 30; // ~1 s of undecoded frames → skip to the next keyframe
+  let videoMode = "pending";        // pending | h264 | mjpeg | ended
+  let videoPath = "/video";
+  let player = null;                // the live H.264 attempt, or null
+  let h264Paused = false;           // H.264 socket closed while the tab is hidden
+
+  function setVideoLabel(kind, detail) {
+    streamKind.textContent = kind;
+    streamStatus.title = detail || "";
+  }
+
+  function h264Unavailable(h264) {
+    if (!h264 || !h264.available) return `H.264 not offered by the server${h264?.reason ? ` (${h264.reason})` : ""}`;
+    if (!window.isSecureContext) return "H.264 needs https or localhost";
+    if (typeof VideoDecoder !== "function" || typeof EncodedVideoChunk !== "function") return "this browser has no WebCodecs decoder";
+    return null;
+  }
+
+  function startVideo(h264) {
+    if (videoMode !== "pending") return; // e.g. the share expired first
+    const why = h264Unavailable(h264);
+    if (why) return startMjpeg(why);
+    videoPath = h264.path || "/video";
+    videoMode = "h264";
+    // Opened in a background tab: wait until it is shown (see below).
+    if (document.hidden) h264Paused = true;
+    else startH264();
+  }
+
+  function startMjpeg(why) {
+    if (videoMode === "mjpeg" || videoMode === "ended") return;
+    stopH264();
+    videoMode = "mjpeg";
+    h264Paused = false;
+    console.info(`[video] MJPEG — ${why}`);
+    setVideoLabel("MJPEG", why);
+    setStreamDot(null);
+    canvas.hidden = true;
+    screen.hidden = false;
+    screen.src = "/stream";
+  }
+
+  function stopH264() {
+    const p = player;
+    if (!p) return;
+    player = null;
+    clearInterval(p.watchdog);
+    try { p.sock.close(); } catch {}
+    try { if (p.decoder && p.decoder.state !== "closed") p.decoder.close(); } catch {}
+  }
+
+  function startH264() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const sock = new WebSocket(`${proto}//${location.host}${videoPath}`);
+    sock.binaryType = "arraybuffer";
+    const p = { sock, decoder: null, waitKey: true, lastFrameAt: 0, startedAt: performance.now(), watchdog: null };
+    player = p;
+    setVideoLabel("H.264", "connecting");
+    // Every callback checks `player === p`: a stopped attempt's late events
+    // (decoder output, the socket's close) must not touch the page.
+    const fail = (why) => { if (player === p) startMjpeg(`H.264 failed: ${why}`); };
+
+    p.watchdog = setInterval(() => {
+      const since = performance.now() - (p.lastFrameAt || p.startedAt);
+      const limit = p.lastFrameAt ? H264_STALL_MS : H264_FIRST_FRAME_MS;
+      if (since > limit) fail(`no frame for ${Math.round(since / 1000)} s`);
+    }, 1000);
+
+    const configure = (cfg) => {
+      if (p.decoder) return;
+      p.decoder = new VideoDecoder({
+        output: (frame) => {
+          if (player !== p) return frame.close();
+          if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+            canvas.width = frame.displayWidth;
+            canvas.height = frame.displayHeight;
+          }
+          ctx2d.drawImage(frame, 0, 0);
+          frame.close();
+          if (!p.lastFrameAt) {
+            canvas.hidden = false;
+            screen.hidden = true;
+            setStreamDot(true);
+            setVideoLabel("H.264", `${cfg.width}×${cfg.height} @${cfg.fps} fps (${cfg.codec})`);
+          }
+          p.lastFrameAt = performance.now();
+        },
+        error: (err) => fail(`decoder: ${err.message}`),
+      });
+      try {
+        // Annex B payloads carry SPS/PPS in-band, so no `description`.
+        p.decoder.configure({ codec: cfg.codec, codedWidth: cfg.width, codedHeight: cfg.height, optimizeForLatency: true });
+      } catch (err) {
+        fail(`decoder: ${err.message}`);
+      }
+    };
+
+    sock.onmessage = (e) => {
+      if (player !== p) return;
+      if (typeof e.data === "string") {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { return; }
+        if (msg.type === "config") configure(msg);
+        return;
+      }
+      if (!p.decoder || p.decoder.state !== "configured") return;
+      // One helper record: u32 length, u8 flags (bit 0 = keyframe),
+      // 3 reserved, u64 timestamp µs, then the Annex B access unit.
+      const buf = e.data;
+      if (buf.byteLength < 16) return fail("short video record");
+      const view = new DataView(buf);
+      const len = view.getUint32(0);
+      if (16 + len !== buf.byteLength) return fail("malformed video record");
+      const key = (view.getUint8(4) & 1) === 1;
+      // A delta frame is only decodable after its keyframe. The server never
+      // sends one after a gap; this covers the decoder falling behind here.
+      if (!key && (p.waitKey || p.decoder.decodeQueueSize > H264_MAX_DECODE_QUEUE)) {
+        p.waitKey = true;
+        return;
+      }
+      p.waitKey = false;
+      try {
+        p.decoder.decode(new EncodedVideoChunk({
+          type: key ? "key" : "delta",
+          timestamp: Number(view.getBigUint64(8)),
+          data: new Uint8Array(buf, 16, len),
+        }));
+      } catch (err) {
+        fail(`decode: ${err.message}`);
+      }
+    };
+
+    sock.onclose = (e) => {
+      if (player !== p) return;
+      // The share behind this page died: final, as on /ws (which shows the
+      // toast). MJPEG would be refused too — keep the last frame and stop.
+      if (e.code === 1008 && e.reason === "share expired") {
+        stopH264();
+        videoMode = "ended";
+        setStreamDot(false);
+        setVideoLabel("H.264", "share expired");
+        return;
+      }
+      fail(`video socket closed (${e.code}${e.reason ? ` ${e.reason}` : ""})`);
+    };
+  }
+
+  // A hidden tab drops its /video socket (the capture stops after the
+  // server's 5 s grace window) and rejoins when shown — on a keyframe, via
+  // the server's cached group of pictures. Browsers may also reclaim a
+  // background tab's decoder, which would otherwise read as a failure.
+  document.addEventListener("visibilitychange", () => {
+    if (videoMode !== "h264") return;
+    if (document.hidden && player) {
+      stopH264();
+      h264Paused = true;
+    } else if (!document.hidden && h264Paused) {
+      h264Paused = false;
+      startH264();
+    }
+  });
 
   // -----------------------------------------------------------------------
   // WebSocket input (with exponential-backoff reconnect)
@@ -380,7 +571,12 @@
       // that link expires. Retrying cannot succeed — the cookie is dead too —
       // so say so once and stop.
       if (e && e.code === 1008 && e.reason === "share expired") {
-        streamDot.classList.remove("ok"); streamDot.classList.add("bad");
+        // No video path can come back either (e.g. a hidden tab's paused
+        // H.264 player rejoining, or a later MJPEG fallback).
+        stopH264();
+        videoMode = "ended";
+        h264Paused = false;
+        setStreamDot(false);
         toast("This share link has expired", "bad");
         return;
       }
@@ -412,11 +608,15 @@
   }
   connectWs();
 
+  // MJPEG hub status. It says nothing about the H.264 path, whose own socket
+  // closing is the signal the player acts on, so it only drives the dot and
+  // the <img> while MJPEG is the live surface.
   function applyStreamStatus(status) {
+    if (videoMode !== "mjpeg") return;
     if (status === "live" || status === "idle") {
-      streamDot.classList.add("ok"); streamDot.classList.remove("bad");
+      setStreamDot(true);
     } else if (status === "dead") {
-      streamDot.classList.remove("ok"); streamDot.classList.add("bad");
+      setStreamDot(false);
       // Kick the img to force a reconnect: server will respawn AXe.
       if (screen.src) screen.src = `/stream?_r=${Date.now()}`;
     }

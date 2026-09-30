@@ -207,3 +207,27 @@ killing either child closes viewers with `1011` and leaves no process behind;
 a viewer that never reads is dropped and the capture stops; Chrome's
 `VideoDecoder` decoded 90/90 frames over the cookie. Taps measured 1.1–2.0 s
 with `/video` streaming.
+
+## 2026-09-30 — 7.3 (browser player) — Phase 7 complete
+
+The page now plays `/video`: when `/api/info` advertises H.264 and the page is
+a secure context with WebCodecs, it decodes each record with `VideoDecoder`
+and draws to a `<canvas>` stretched over the same device-aspect wrap and under
+the same overlay as the MJPEG `<img>`, so input mapping is unchanged. Any
+failure — decoder error, socket close, no frame for 8 s at start or 4 s later —
+switches to MJPEG once, for good; `1008 share expired` ends both. A hidden tab
+drops `/video` and rejoins when shown. The header reads `H.264` or `MJPEG`,
+with the reason as a tooltip.
+
+Gotcha found on the way: AXe 1.8.0's default coordinate tap (`tapAt`) acks but
+does nothing on iOS 27 simulators — from the CLI too — so every browser tap had
+been silently lost; `--tap-style physical` lands. The server now passes it.
+The input checks ran on a fresh clone (deleted after), since the run's shared
+clone had been left inside Settings by earlier probing.
+
+Verified in Chrome on a sandbox clone: 30 fps drawn on `localhost`, overlay taps
+open Settings rows, taps ack in 1.0–2.0 s with H.264 playing; killing the
+encoder → MJPEG with one `/video` connect in the log; freezing it → MJPEG in
+4.2 s; no `VideoDecoder`, a refused codec, plain-http `--remote lan`, and no
+helper → MJPEG from the start; a 20 s share expiring while the tab was hidden
+did not rejoin. Tests unchanged: `npm test` 59/59, `swift test` 11.
