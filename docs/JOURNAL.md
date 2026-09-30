@@ -170,3 +170,40 @@ frame sizes. H.264 4:2:0 can't code odd sizes, so 603×1311 encodes as 602×1310
 (25 cases); live on a sandbox clone, scrolling Settings: 30.3 fps at scale 0.5
 and 30.7 at 1.0 from framed timestamps, keyframes ≤ 1.05 s apart, `ffprobe`
 decoding every frame; `npm test` still 21/21.
+
+## 2026-09-30 — 7.2 (H.264 hub + authenticated `/video` WebSocket)
+
+The server now spawns `axe stream-video --format bgra` with its stdout handed
+straight to the encoder helper (a file descriptor, never through Node) and
+serves the result on `/video`: one JSON `config` message (codec string read
+from the SPS), then one helper record per binary message. New pure module
+`h264.js` holds the capture plan, the record parser, the group-of-pictures
+cache and `H264Hub` — refcount, 5 s grace window, generation guard,
+keyframe-on-join, and the slow-viewer rule (skipped forward at ~2 s of
+backlog, closed with `1013` after 10 s behind). `/video` authorizes through
+`requestAuthorized()` in the shared upgrade handler and registers with
+`ShareRegistry.track()`; `/api/info` and `hello` advertise `h264`, and status
+is broadcast as `{type:"h264"}`. `start.sh` builds the helper when it is
+missing or stale; without it the server logs "MJPEG only" and `/video` answers
+`404`. MJPEG and the page are untouched. New `scripts/video-probe.js` is the
+scripted client used for the done check.
+
+Found on the way, both in the WebSocket entry `/video` was about to share and
+both fatal to the process: a malformed `Host` header on any upgrade request
+threw out of the handler (no credential needed), and a protocol-invalid frame
+on `/ws` was an unhandled `error` event. Fixed; now an invariant in
+`docs/architecture.md`. Gotcha: `simctl io <udid> screenshot -` does not write
+to stdout — it creates a file named `-` — so the startup pixel-size probe goes
+through a temp file. Node's stdio pipes are socketpairs on macOS; handing one
+to the helper still held 30 fps at scale 1.0.
+
+Tests: `npm test` 59/59 (38 new — parser at every chunk boundary, the cache,
+the hub on a fake pipeline and clock); `swift test` 11. Live on a sandbox
+clone: 5 s of `/video` = 146 records at 31 fps, keyframes ≤ 1.0 s apart,
+`ffprobe` decoding every one; 1206×2622 at scale 1.0 and 300×654 @10 fps also
+decode; unauthenticated upgrade `401`; a `--share 30s` viewer closed with
+`1008 share expired`; three connections inside the grace window = one spawn;
+killing either child closes viewers with `1011` and leaves no process behind;
+a viewer that never reads is dropped and the capture stops; Chrome's
+`VideoDecoder` decoded 90/90 frames over the cookie. Taps measured 1.1–2.0 s
+with `/video` streaming.

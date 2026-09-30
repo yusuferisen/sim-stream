@@ -12,8 +12,9 @@ CLI](https://github.com/cameroncooke/AXe) to capture frames and to inject
 input, and serves both over plain HTTP/WebSocket behind a shareable token link (exchanged
 for an httpOnly cookie on first load). Links minted for other people expire on
 their own.
-There is no account, no hosted backend, and no build step — `npm i && node
-server.js`. Reaching it from outside the machine is opt-in: `--remote` selects
+There is no account, no hosted backend, and no required build step — `npm i &&
+node server.js`. An optional Swift helper adds a 30 fps H.264 stream beside the
+MJPEG one; the page itself still shows MJPEG. Reaching it from outside the machine is opt-in: `--remote` selects
 a provider (Tailscale today), and that is the only point at which anything
 leaves the host.
 
@@ -32,27 +33,36 @@ flowchart TB
             auth["requestAuthorized<br/>query · x-token · cookie"]
             reg["shares.js — ShareRegistry<br/>owner token + expiring shares<br/>timingSafeEqual · expiry sweep"]
             hub["MjpegHub<br/>refcounted, 5s grace"]
+            vhub["h264.js — H264Hub<br/>refcounted, 5s grace<br/>keyframe on join · slow-viewer skip"]
             queue["CommandQueue<br/>FIFO, one axe at a time"]
             info["/api/info<br/>simulator · bounds · stream cfg"]
         end
         remote["remote.js<br/>PROVIDERS: lan · tailscale-serve · tailscale-funnel"]
         axe["axe CLI"]
+        enc["sim-stream-encoder<br/>(optional Swift helper)"]
         sim["iOS Simulator"]
     end
+    script["Scripted viewer<br/>scripts/video-probe.js"]
 
     img -- "GET /stream<br/>multipart/x-mixed-replace" --> auth
     ptr -- "WS /ws — JSON events" --> auth
     ctl -- "WS /ws" --> auth
     auth -- "match token" --> reg
     auth --> hub
+    auth --> vhub
+    script -- "WS /video — H.264 records" --> auth
     auth --> queue
     auth --> info
-    reg -. "on expiry: end that share's /stream + /ws" .-> auth
+    reg -. "on expiry: end that share's /stream, /ws + /video" .-> auth
     hub -- "spawn axe stream-video --format mjpeg" --> axe
+    vhub -- "spawn axe stream-video --format bgra" --> axe
+    axe -- "raw frames (fd hand-off)" --> enc
+    enc -- "H.264 records" --> vhub
     queue -- "spawn axe tap/swipe/touch/type/key/button" --> axe
     axe --> sim
     sim -- "frames" --> axe
     hub -. "status: idle | live | dead (broadcast to all WS)" .-> ptr
+    vhub -. "status: idle | live | dead (broadcast to all WS)" .-> ptr
     remote -. "establishes the tunnel the browser reaches" .-> srv
 ```
 
@@ -60,7 +70,9 @@ flowchart TB
 
 There is no database and nothing persists between runs. The only durable
 artifacts are screenshots written to `~/Desktop/`. What the system holds is
-process state — the capture process below, and the token registry after it:
+process state — the capture process below, and the token registry after it.
+The H.264 hub runs the same state machine over its own pipeline (AXe plus the
+encoder helper), independently of the MJPEG one:
 
 ```mermaid
 stateDiagram-v2
@@ -90,14 +102,15 @@ stateDiagram-v2
     expired --> [*]: never revived — restart mints new tokens
     note right of expired
         On the transition the server closes every
-        /stream and /ws the share authorized, and
-        its link, cookie and x-token all answer 401.
+        /stream, /ws and /video the share authorized,
+        and its link, cookie and x-token all answer 401.
     end note
 ```
 
 Per-run configuration, resolved once at startup and never mutated: `PORT`,
 `HOST`, `FPS`, `QUALITY`, `SCALE`, the simulator UDID, its logical `bounds`,
-and the set of tokens (the registry gains no entries after startup; shares
+whether the H.264 path exists (helper built, screen size measured) and its
+picture size, and the set of tokens (the registry gains no entries after startup; shares
 only expire out of it).
 
 ## User stories, as currently implemented
@@ -137,6 +150,17 @@ in one command rather than keystroke-by-keystroke.
 buttons in the panel. The ▲/▼/←/→ controls send preset swipes from the center
 of the screen.
 
+**Pull a 30 fps H.264 stream from a script.** When the encoder helper is built
+(`./scripts/start.sh` builds it if `swift` is available; `npm run build:helper`
+does it by hand), the server also offers `/video`: a WebSocket that sends a
+`config` message and then one H.264 frame per binary message, starting on a
+keyframe. It takes the same token, cookie or header as everything else, and a
+share link's expiry closes it like any other connection. `/api/info` says
+whether it is available and how large the picture is. Without the helper the
+server runs exactly as before and says "MJPEG only" at startup.
+`scripts/video-probe.js` is the ready-made client: it reports the frame rate
+and can save the stream for `ffprobe`.
+
 **Capture what you're looking at.** The screenshot control saves to
 `~/Desktop/sim-stream-<timestamp>.png` and confirms with a toast.
 
@@ -150,15 +174,18 @@ so they can be chained.
 
 Known and accepted, not defects:
 
-- **~7–10 fps.** That is what AXe's MJPEG mode delivers, so the `--fps` flag is
-  an upper bound it won't reach. Fine for verifying layout and placement; not
-  enough for judging animation or scroll feel.
+- **~7–10 fps in the browser.** That is what AXe's MJPEG mode delivers, so for
+  the page the `--fps` flag is an upper bound it won't reach. Fine for
+  verifying layout and placement; not enough for judging animation or scroll
+  feel. The 30 fps H.264 stream exists on `/video`, but the page does not play
+  it.
 - **US keyboard only.** AXe's `type` uses HID keycodes — no accented or
   non-ASCII characters.
 - **Single touch.** No pinch, no rotate, no multi-finger gestures.
 - **One simulator per server.** The UDID is fixed at startup.
 - **No stream heartbeat beyond start/stop.** If the AXe process *hangs* rather
   than exits, the status dot can stay green until something eventually throws.
+  The same holds for the H.264 pipeline: its status stays `live`.
 - **Shares can't be extended, revoked one at a time, or minted while
   running.** They are fixed at startup; the only revocation is restarting the
   server, which kills every link including the operator's own.

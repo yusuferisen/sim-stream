@@ -11,6 +11,7 @@
 #   ./scripts/start.sh --remote tailscale-funnel # PUBLIC HTTPS via Funnel
 #   ./scripts/start.sh --share demo=2h           # also mint a link that expires (repeatable)
 #   ./scripts/start.sh --no-auth                 # disable token auth (local only!)
+# Also builds the optional H.264 encoder helper when `swift` is available.
 # Any extra flags are passed through to node server.js. See README.md for the
 # full --remote provider list and prerequisites.
 
@@ -52,6 +53,21 @@ fi
 if [[ ! -d node_modules ]]; then
   echo "[sim-stream] installing node dependencies..."
   npm install --silent
+fi
+
+# The H.264 encoder helper is an optional upgrade (30 fps video on /video).
+# Build it when there is a Swift toolchain and the binary is missing or older
+# than its sources; on any failure carry on — the server then serves MJPEG
+# only, and says so at startup.
+ENCODER="helper/.build/release/sim-stream-encoder"
+if command -v swift >/dev/null 2>&1; then
+  if [[ ! -x "$ENCODER" ]] || [[ -n "$(find helper/Package.swift helper/Sources -newer "$ENCODER" -print -quit 2>/dev/null)" ]]; then
+    echo "[sim-stream] building the H.264 encoder helper (a minute the first time)..."
+    if ! BUILD_LOG="$(swift build -c release --package-path helper 2>&1)"; then
+      echo "[sim-stream] helper build failed — continuing without it (an earlier build, if any, is still used):"
+      echo "$BUILD_LOG" | tail -n 15 | sed 's/^/    /'
+    fi
+  fi
 fi
 
 # Translate --no-auth into --auth false, which server.js expects.

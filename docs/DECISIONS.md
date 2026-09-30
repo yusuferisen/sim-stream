@@ -490,3 +490,54 @@ Logged so the run does not stop to ask. Each is cheap to change later.
   instead of resolving coordinates in the server: AXe 1.8.0 does the lookup,
   taps the element's activation point, and reports "no match" and "multiple
   matches" itself. Those errors are shown, never resolved by guessing.
+
+---
+
+## 2026-09-30 — H.264 hub mechanics (7.2)
+
+Choices made while building the hub and `/video`; all reversible.
+
+- **`/video` forwards the helper's records unchanged**, one per binary message,
+  after a single JSON `config` message carrying the codec string. The 16-byte
+  header already holds what a decoder needs per frame (key/delta, timestamp),
+  so re-framing would only add a second format to keep in step. The server
+  reads the codec string out of the SPS so the browser needs no bitstream
+  parsing. *Rejected:* a custom per-message header; advertising the codec in
+  `/api/info` (it is only known once the encoder has produced a keyframe).
+- **`--fps` is shared, with split defaults.** Not given: MJPEG stays at 15,
+  H.264 runs at 30 (the pre-flight's stream shape). Given: it sets both. Values
+  outside the helper's ranges are clamped with a log line; a non-number turns
+  H.264 off. *Rejected:* a second flag (`--video-fps`) — another knob for one
+  idea, "how fast to capture"; rejecting out-of-range values at startup — it
+  would break `--fps`/`--scale` invocations that work today for MJPEG.
+- **A lagging viewer is skipped forward, then dropped.** More than about two
+  seconds of video unsent in its socket → nothing more until a keyframe finds
+  the backlog mostly drained; still behind after 10 s → closed with `1013`.
+  The second half is what stops a vanished phone from holding the 30 fps
+  capture (and its cost to tap latency) for the minutes TCP takes to notice.
+  *Rejected:* dropping frames without the keyframe rule (undecodable); queueing
+  (unbounded); closing at the first sign of lag (a brief stall would cost a
+  reconnect and a respawn).
+- **Hub close codes are `1011` (capture ended) and `1013` (too slow)** — never
+  `1006`/`1008`, which the client reads as a bad credential.
+- **Without the helper, an authorized `/video` upgrade answers `404`**, after
+  the credential check — an unauthenticated caller learns nothing about what is
+  built.
+- **The screen's pixel size is measured once, at startup**, from a screenshot
+  written to a temp file (`simctl io screenshot -` writes a file named `-`; it
+  does not mean stdout). A failed measurement means MJPEG only for that run
+  rather than a retry on first connect: `/api/info` must be able to state the
+  picture size before anyone connects.
+- **`start.sh` builds the helper only when it is missing or older than its
+  sources**, so an ordinary start pays nothing; a failed build is printed and
+  skipped.
+- **The hub lives in the pure module, not in `server.js`.** The roadmap asked
+  for the parser, cache and drop logic to be import-safe; the refcount and
+  generation rules went with them, behind an injected `spawnPipeline`, because
+  they are the part that fails silently and the part MJPEG's hub has never had
+  a test for.
+- **Two crash paths in the shared WebSocket entry were closed here**, since
+  `/video` was about to inherit them: a malformed `Host` header on any upgrade
+  request threw out of the handler (no credential needed), and a protocol-
+  invalid frame on `/ws` was an unhandled `error` event. Both killed the
+  process. Now an invariant in `docs/architecture.md`.

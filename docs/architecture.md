@@ -9,18 +9,21 @@
 ## Shape
 
 A single-process ESM Node server that translates browser events into AXe CLI
-invocations and pipes AXe's MJPEG output back out. There is no build step, no
+invocations and pipes AXe's video back out — as MJPEG always, and as H.264
+when the optional encoder helper is built. There is no required build step, no
 database, no framework beyond Express + `ws`, and no state that outlives the
 process.
 
 | Module | Responsibility |
 |---|---|
-| `server.js` | Everything server-side: arg parsing, simulator discovery/boot, the auth check sites, HTTP routes, WebSocket, the MJPEG hub, the AXe command queue, input translation, shutdown. |
+| `server.js` | Everything server-side: arg parsing, simulator discovery/boot, the auth check sites, HTTP routes, both WebSocket endpoints, the MJPEG hub, spawning the H.264 capture pipeline, the AXe command queue, input translation, shutdown. |
+| `h264.js` | The H.264 path's logic (§ H.264 video path): the capture plan, the helper-record parser, the group-of-pictures cache, and `H264Hub` — refcount, grace window, generation guard and per-viewer delivery. Pure, like `shares.js`: the pipeline, the sockets, the clock and the timers are handed in, so it is unit-testable without a simulator. |
 | `shares.js` | The credential registry (`ShareRegistry`): the owner token plus expiring share tokens, constant-time matching, the definition of expiry, and the tracking that ends long-lived connections when a share dies. Pure — no I/O, no side effects at import, clocks injectable — so it is unit-testable without a simulator. Also exports `parseTtl` / `parseShareSpec`. |
 | `remote.js` | Remote-access providers only. Exports `getRemoteProvider(name)` and `listRemoteProviders()`. Knows nothing about streaming or input. |
 | `public/index.html` | The entire client — markup, styles, and script in one file. Served with one templated substitution. |
-| `helper/` | **Optional** SwiftPM package: `sim-stream-encoder`, raw BGRA frames on stdin → VideoToolbox H.264 on stdout. Built by `npm run build:helper`; nothing requires it (§ H.264 encoder helper). Its pure logic (`EncoderCore`: arguments, AXe's frame layout, output framing) has a `swift test` target. |
-| `scripts/start.sh` | Dev launcher: verifies AXe is present, installs node deps if absent, handles `--list`, translates `--no-auth` → `--auth false`, `exec`s the server. |
+| `helper/` | **Optional** SwiftPM package: `sim-stream-encoder`, raw BGRA frames on stdin → VideoToolbox H.264 on stdout. Built by `npm run build:helper` (or by `start.sh`); nothing requires it (§ H.264 encoder helper). Its pure logic (`EncoderCore`: arguments, AXe's frame layout, output framing) has a `swift test` target. |
+| `scripts/start.sh` | Dev launcher: verifies AXe is present, installs node deps if absent, builds the encoder helper when `swift` is on PATH and the binary is missing or older than its sources (a failed build is reported and skipped, never fatal), handles `--list`, translates `--no-auth` → `--auth false`, `exec`s the server. |
+| `scripts/video-probe.js` | Verification tool: a scripted `/video` client that reports what arrived (record and keyframe counts, frame rate, close code) and can save the stream for `ffprobe`. Not used by the server. |
 
 ## Dependencies
 
@@ -40,21 +43,28 @@ process.
 
 ## Data flow
 
-Two independent channels, deliberately not multiplexed:
+Independent channels, deliberately not multiplexed:
 
-1. **Video, server → browser.** `GET /stream` responds
+1. **Video (MJPEG), server → browser.** `GET /stream` responds
    `multipart/x-mixed-replace; boundary=--mjpegstream` and registers the
    response with the `MjpegHub`. The hub spawns
    `axe stream-video --format mjpeg`, strips the leading HTTP headers AXe
    emits before the first part, and writes every subsequent chunk to all
    registered responses. The browser decodes it natively in an `<img>`.
-2. **Input, browser → server.** `WS /ws` carries JSON events. Each is parsed,
+2. **Video (H.264), server → viewer.** `WS /video`, present only when the
+   encoder helper is built. `H264Hub` spawns `axe stream-video --format bgra`
+   with its stdout handed straight to `sim-stream-encoder`, parses the
+   helper's records, and sends each as one binary message (§ H.264 video
+   path). The page does not use it yet — it is an endpoint for scripts until
+   the browser player exists.
+3. **Input, browser → server.** `WS /ws` carries JSON events. Each is parsed,
    passed to `dispatchInput()`, and acked as `{type:"ack", id}` or
    `{type:"error", id, message}`.
 
-Out-of-band on the same WebSocket: a `{type:"hello", simulator, bounds, stream}`
-frame on connect, and `{type:"stream", status}` broadcasts whenever the hub's
-status changes.
+Out-of-band on the input WebSocket: a `{type:"hello", simulator, bounds,
+stream, h264}` frame on connect, `{type:"stream", status}` broadcasts whenever
+the MJPEG hub's status changes, and `{type:"h264", status}` whenever the H.264
+hub's does.
 
 ## Invariants
 
@@ -67,11 +77,15 @@ if nothing throws.
 - **The capture process is refcounted, with a grace window.** `MjpegHub` spawns
   on the first client and stops 5 s (`graceMs`) after the last one leaves.
   Page reloads are a leave-then-join inside that window and must not restart
-  AXe.
+  AXe. `H264Hub` keeps the same rule for its own pipeline; the two hubs are
+  independent, so one MJPEG viewer plus one H.264 viewer means two AXe capture
+  processes — accepted, not shared.
 - **Only the current generation may act.** Each spawn bumps `generation`; the
   data handler *and* the exit handler each capture it and compare before doing
   anything. Without it, a dying old process tears down its replacement and its
-  trailing stdout bleeds into the new stream.
+  trailing stdout bleeds into the new stream. `H264Hub` also bumps it on every
+  deliberate stop and on a death, so the exit of a pipeline it stopped is never
+  mistaken for a failure.
 - **Status is broadcast, never inferred.** `idle | live | dead` transitions
   emit to every WebSocket client, so a viewer that connected while the stream
   was dead learns when it recovers. The client must not derive status from
@@ -81,9 +95,11 @@ if nothing throws.
   `[0,1]` before scaling by `bounds`, so a malformed or out-of-range event
   cannot produce an off-screen coordinate.
 - **Auth is checked at two sites through one function.** Every HTTP route
-  (`/`, `/api/info`, `/stream`) goes through the `authCheck` middleware; the
-  WebSocket is checked separately in `server.on("upgrade")` before
-  `handleUpgrade`. Both call `requestAuthorized(req, queryToken)`, which
+  (`/`, `/api/info`, `/stream`) goes through the `authCheck` middleware; both
+  WebSocket endpoints (`/ws`, `/video`) are checked in the single
+  `server.on("upgrade")` handler before `handleUpgrade` — path, then
+  credential (`401`), then whether `/video` exists at all (`404` without the
+  helper). Both sites call `requestAuthorized(req, queryToken)`, which
   returns the registry entry the request is authorized as (or `null`) from one
   of three channels: `?token=`, an `x-token` request header (scripted access),
   or the `sim_stream_<PORT>` cookie. Credential channels are added or removed
@@ -109,16 +125,31 @@ if nothing throws.
   (cannot be set back) — and expiry **latches**: once observed dead, an entry
   stays dead whatever the clocks do. Every failure direction is "dies early,"
   never "lives longer."
-- **Expiry ends open connections, not just new requests.** `/stream` and `/ws`
-  authorize once, at connect, so each registers with `ShareRegistry.track()`
-  against the share that admitted it. `watch()` sweeps at each deadline (and
-  at least once a second, which also keeps every delay under `setTimeout`'s
+- **Expiry ends open connections, not just new requests.** `/stream`, `/ws`
+  and `/video` authorize once, at connect, so each registers with
+  `ShareRegistry.track()` against the share that admitted it. `watch()` sweeps
+  at each deadline (and at least once a second, which also keeps every delay under `setTimeout`'s
   2³¹−1 ms ceiling): MJPEG responses are destroyed — which fires `close`, the
   same path the hub's refcount uses — and WebSockets are closed with `1008`
   and the reason `share expired`. Input is additionally checked per message,
-  because `close()` only starts a handshake and a client may never answer it.
+  because `close()` only starts a handshake and a client may never answer it;
+  for the same reason a `/video` viewer is taken out of the hub *before* its
+  socket is closed, so not one more frame is sent to it.
   A new long-lived entry point must `track()` its connection or it outlives
   its link.
+- **Nothing a client sends may throw out of a handler.** The upgrade handler
+  parses the request target against a fixed base — never the `Host` header,
+  which is attacker-controlled and need not be a valid hostname — and every
+  accepted WebSocket has an `error` listener, because `ws` reports a malformed
+  frame as an `error` event and an unhandled one is an uncaught exception.
+  Either omission lets a single request take the process down.
+- **A `/video` viewer only ever receives a decodable stream.** Its first frame
+  is a keyframe, preceded by one `config` message, and it is never sent a delta
+  frame after a gap. A viewer whose socket holds more than about two seconds of
+  unsent video is sent nothing until a keyframe arrives with that backlog
+  mostly drained — skipped forward, never queued for without bound — and one
+  that stays behind for 10 s is closed, so a vanished peer cannot keep the
+  capture pipeline running.
 - **The token leaves the URL on page load.** An authorized `GET /` whose URL
   still carries `token` responds `302` to the same URL minus that parameter,
   with `Set-Cookie: sim_stream_<PORT>=…; HttpOnly; SameSite=Lax; Path=/`
@@ -182,9 +213,10 @@ Places designed to be extended, and the contract each one implies.
 
 ## H.264 encoder helper (`helper/`) — the contract the server builds on
 
-`sim-stream-encoder` is a standalone process: nothing in `server.js` or
-`start.sh` knows about it yet. Whoever spawns it works from this section, not
-from the Swift.
+`sim-stream-encoder` is a standalone process with a written contract: the
+server (`spawnH264Pipeline` in `server.js`, the parser in `h264.js`) is built
+on this section, not on the Swift. § H.264 video path is what the server does
+with it.
 
 **Build.** `npm run build:helper` (= `swift build -c release --package-path
 helper`) → `helper/.build/release/sim-stream-encoder`. Tests: `swift test` in
@@ -250,6 +282,71 @@ AXe — is how to stop it.
 output): 30.3 fps at scale 0.5 (541 frames, keyframes ≤ 1.05 s apart), 30.7 fps
 at 1.0; `ffprobe` decodes every frame of the unframed payload.
 
+## H.264 video path (`h264.js`, `/video`)
+
+**Availability is decided once, at startup.** The path exists for a run only
+if the helper binary is present and the simulator's pixel size could be read
+from a screenshot (`planH264`). Otherwise there is no hub, `/video` answers
+`404` to an authorized upgrade, and MJPEG is the whole video path — one log
+line and the `video:` banner line say which. `/api/info` and the `hello` frame
+carry the outcome:
+
+```
+h264: { available: true, path: "/video", width, height, fps }   // hello adds status
+h264: { available: false, reason }
+```
+
+`width × height` is the decoded picture (even dimensions, § H.264 encoder
+helper); it maps onto the whole screen, i.e. onto `bounds`.
+
+**The capture plan (`planCapture`).** Size follows `--scale`; the rate is 30
+fps unless `--fps` was given, in which case it is that. Values outside the
+helper's ranges (fps 1–30, scale 0.1–1.0) are clamped with a log line; a value
+that is not a number turns the H.264 path off rather than being guessed at.
+AXe and the helper are always given the same fps and scale — the helper
+derives AXe's frame layout from them.
+
+**The pipeline (`spawnH264Pipeline`).** Two children: AXe, and the helper with
+AXe's stdout as its stdin. The descriptor is handed over and the server closes
+its own copy — raw frames never pass through Node (~95 MB/s at the default
+scale), and with no third holder of the pipe a dead helper gives AXe `EPIPE`
+instead of a full pipe. When either child ends, the other is terminated
+(`SIGTERM`, then `SIGKILL` after 2 s) and the hub is told once both are gone.
+
+**Wire format on `/video`.** Server → viewer only; the endpoint accepts no
+messages (anything over 1 KiB closes the socket with `1009`).
+
+1. One **text** message first: `{"type":"config","codec":"avc1.4d001f",
+   "width":602,"height":1310,"fps":30}`. `codec` is read from the stream's SPS
+   and is what `VideoDecoder.configure()` takes; no `description` is needed.
+2. Then **binary** messages, each exactly one helper record — the 16-byte
+   header and its Annex B access unit, byte for byte (§ H.264 encoder helper,
+   *Output*). Bit 0 of byte 4 says key or delta; bytes 8–15 are the timestamp
+   in µs. The first binary message is always a keyframe.
+
+A viewer that joins mid-stream is sent the cached group of pictures (the
+latest keyframe and everything since) at once, so it decodes to the live frame
+immediately instead of waiting up to a second.
+
+**Close codes.** `1008 share expired` — final, as on `/ws`. `1011 capture
+ended` — the pipeline died; reconnecting respawns it. `1013 viewer too slow` —
+the viewer stopped draining. None of the hub's own closes is `1006`/`1008`, so
+those keep meaning "your credential is bad". A client should treat `1011` and
+`1013` as "fall back to MJPEG or retry with backoff", not as a reason to
+reconnect in a tight loop: each reconnect after a death spawns a pipeline.
+
+**Status.** `idle | live | dead`, broadcast on `/ws` as `{type:"h264",
+status}`. `live` means the pipeline is running, not that a frame has arrived —
+like MJPEG, there is no heartbeat: a pipeline that hangs without exiting stays
+`live`.
+
+**Bounds that hold by construction.** The parser refuses a record header that
+cannot be right (length over 16 MiB, reserved bytes set) and the hub restarts
+nothing on its own — the stream is marked `dead` and viewers are closed, since
+a byte stream with no markers cannot be resynchronised. The group-of-pictures
+cache empties itself if keyframes stop coming (150 frames / 32 MiB) rather
+than grow.
+
 ## Notable asymmetries
 
 Deliberate, and worth knowing before "fixing" them:
@@ -288,12 +385,17 @@ parsing, AXe's frame layout (pinned to measured frame sizes), and the output
 framing. The VideoToolbox path itself is verified by piping a live AXe stream
 through the binary (§ H.264 encoder helper, *Measured*).
 
-**`npm test`** (`node --test`, no dependencies) covers the one module that
-needs no simulator: `shares.js` — TTL and `--share` parsing, token matching,
+**`npm test`** (`node --test`, no dependencies) covers the two modules that
+need no simulator. `shares.js` — TTL and `--share` parsing, token matching,
 the expiry boundary, the two-clock and latch rules, session tracking, and the
 expiry timer. Anything that changes how a token is accepted or when it dies
 belongs there first; expiry bugs are silent, and these tests are the only
-thing that would surface one.
+thing that would surface one. `h264.js` — the capture plan (pinned to the
+measured picture sizes), record parsing at every possible chunk boundary, the
+group-of-pictures cache, and the hub on a fake pipeline, fake viewers and a
+hand-cranked clock: refcount and grace window, the generation guard, what a
+joining or lagging viewer is sent, and what happens when the pipeline dies.
+The hub's rules fail silently too, so a change to them belongs there first.
 
 Everything else has **no automated coverage**, and the reason is structural:
 every other meaningful path requires a booted iOS Simulator plus the AXe binary
@@ -317,6 +419,14 @@ phase gate is a browser session:
    the server must log the share's expiry with the number of connections it
    closed, and reopening the link must answer `401` — including in a browser
    that still holds your own cookie.
+8. If touching the H.264 path, with the helper built:
+   `node scripts/video-probe.js --token <T> --seconds 5 --out /tmp/v.h264`
+   must report a keyframe first, ≥25 fps and keyframes ≤ ~1 s apart, and
+   `ffprobe -count_frames /tmp/v.h264` must decode every record. Without
+   `--token` the probe must report `refused: 401`; with a `--share 30s` token
+   and `--seconds 0` it must end with close `1008 share expired`. Two probes
+   inside 5 s must log a single `[h264] spawn`. Then move the helper binary
+   aside and confirm the server starts MJPEG-only and `/video` answers `404`.
 
 The rest of what *can* be unit-tested without a simulator — `parseArgs`, `pt()`
 clamping, `boundsForDeviceType`, provider selection — still lives in

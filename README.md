@@ -36,6 +36,8 @@ decisions, and history live in [`docs/`](docs/).
 - macOS with Xcode + iOS Simulator installed (`xcrun simctl` available)
 - [AXe CLI](https://github.com/cameroncooke/AXe) — `brew install cameroncooke/axe/axe`
 - Node.js 18+ (uses ESM, top-level `crypto.timingSafeEqual`, `EventEmitter`)
+- Optional: the Swift toolchain that ships with Xcode, to build the H.264
+  encoder helper (30 fps video on `/video`). Without it everything else works.
 
 ## Install
 
@@ -72,7 +74,12 @@ sim-stream running
   token:     a3f94c...  (yours — never expires; restart to revoke)
   simulator: iPhone 17 Pro Max (3B76...)
   stream:    15fps scale=0.5 quality=75
+  video:     H.264 660x1434 @30fps on /video (MJPEG on /stream)
 ```
+
+The `video:` line reads `MJPEG only — …` when the optional encoder helper is
+not built. `start.sh` builds it for you when `swift` is available; running
+`node server.js` directly, build it once with `npm run build:helper`.
 
 Open the URL in any browser. You should see the live simulator screen.
 
@@ -193,9 +200,9 @@ All flags can be passed to `scripts/start.sh` or to `node server.js` directly:
 |------------------|-------------|-----------------------------------------------|
 | `--port <N>`     | `8080`      | HTTP port                                     |
 | `--host <addr>`  | `127.0.0.1` | Bind address. Use `0.0.0.0` for LAN           |
-| `--fps <N>`      | `15`        | Target capture FPS (1–30; AXe caps ~7–10)     |
+| `--fps <N>`      | `15` / `30` | Target capture FPS, 1–30. MJPEG defaults to 15 (AXe delivers ~7–10 whatever you ask); the H.264 stream defaults to 30. Giving the flag sets both |
 | `--quality <N>`  | `75`        | JPEG quality (1–100)                          |
-| `--scale <N>`    | `0.5`       | Frame size multiplier (0.1–1.0)               |
+| `--scale <N>`    | `0.5`       | Frame size multiplier (0.1–1.0), for both video paths |
 | `--udid <UDID>`  | auto        | Specific simulator UDID                       |
 | `--token <str>`  | random hex  | Your own auth token — valid until the process exits. Every route and the WebSocket accept a token as `?token=…`, an `x-token` header (scripts), or the httpOnly cookie set when the page is opened. One credential is checked per request: the query if present, else the header, else the cookie |
 | `--share [label=]<ttl>` | —    | Mint an extra link that expires after `<ttl>` (`45s`, `30m`, `2h`, `1d`). Repeatable. See [Share links that expire](#share-links-that-expire) |
@@ -211,7 +218,8 @@ treating `token` as a boolean.
 
 ## How it works
 
-There are two independent channels between the browser and the server:
+There are two independent channels between the browser and the server, plus
+a third for scripts:
 
 1. **MJPEG video stream** — `GET /stream` returns `multipart/x-mixed-replace`.
    The server spawns `axe stream-video --format mjpeg …` and pipes its
@@ -223,9 +231,18 @@ There are two independent channels between the browser and the server:
    commands (`tap`, `swipe`, `touch`, `type`, `key`, `button`) serialized
    through a FIFO queue. Acks come back as `{type: "ack", id}`.
 
-Server also broadcasts MJPEG hub state changes (`idle` / `live` / `dead`)
-to all WS clients so the status indicator reflects reality, not just the
-initial load.
+3. **H.264 video stream (optional)** — `/video` is a WebSocket that sends
+   30 fps H.264, one frame per binary message, when the encoder helper is
+   built: the server pipes `axe stream-video --format bgra` into
+   `sim-stream-encoder` (VideoToolbox) and fans the result out. It uses the
+   same token / cookie / header as everything else. The web page does not
+   play it yet; try it with
+   `node scripts/video-probe.js --token <TOKEN> --seconds 5 --out clip.h264`.
+   The message format is in `docs/architecture.md` § H.264 video path.
+
+Server also broadcasts hub state changes (`idle` / `live` / `dead`) for both
+video paths to all WS clients so the status indicator reflects reality, not
+just the initial load.
 
 Coordinates travel as normalized `(0..1, 0..1)` from the browser; the
 server maps them to simulator logical points using bounds it computes once
@@ -236,18 +253,21 @@ at startup from the device type (e.g. iPhone 17 Pro Max → 440×956).
 | Path                      | Purpose                                                              |
 |---------------------------|----------------------------------------------------------------------|
 | `server.js`               | Node.js server: HTTP, WS, MJPEG hub, AXe command queue, auth         |
+| `h264.js`                 | H.264 path logic: record parser, keyframe cache, the `/video` hub    |
+| `test/h264.test.js`       | Unit tests for it (`npm test`; no simulator needed)                  |
+| `scripts/video-probe.js`  | Scripted `/video` client: frame rate, close code, saves the stream   |
 | `shares.js`               | The token registry: your token plus expiring share tokens            |
 | `test/shares.test.js`     | Unit tests for the registry (`npm test`; no simulator needed)        |
 | `remote.js`               | Pluggable remote-access providers (LAN / Tailscale Serve / Funnel)   |
 | `public/index.html`       | Single-page client: MJPEG `<img>`, pointer/gesture detection, toolbar |
-| `scripts/start.sh`        | Dev launcher: checks AXe, installs deps, boots simulator, runs server |
+| `scripts/start.sh`        | Dev launcher: checks AXe, installs deps, builds the encoder helper, boots simulator, runs server |
 | `helper/`                 | Optional Swift encoder (`npm run build:helper`): AXe raw frames → H.264; contract in `docs/architecture.md` |
 
 ## Limitations
 
-- **Capture rate caps at ~7–10 fps.** That is the ceiling of AXe's MJPEG
-  mode, which this server uses, whatever `--fps` asks for. (AXe's raw-frame
-  mode reaches 30 fps, but needs an encoder the server doesn't have.)
+- **The page shows ~7–10 fps.** That is the ceiling of AXe's MJPEG mode,
+  which the browser view uses, whatever `--fps` asks for. The 30 fps H.264
+  stream on `/video` is there for scripts; the page does not play it yet.
 - **`--scale 1.0` is very heavy.** At full scale AXe's MJPEG mode sends
   ~3.6 MB PNG frames — roughly 30 MB/s. Stay at the default `0.5` unless
   you're on the same machine.
@@ -280,6 +300,11 @@ the redirect.
 new tokens). A link with a dead `?token=` is refused even in a browser that
 still holds a valid cookie, so an expired link looks expired to you too.
 Restart with a fresh `--share` to issue a new one.
+
+**Startup says `video: MJPEG only`** — the H.264 encoder helper isn't built
+(`npm run build:helper`; needs the Swift toolchain from Xcode), or the server
+could not take the startup screenshot it measures the screen with. The reason
+is on that line. Everything except `/video` works without it.
 
 **Stream freezes after a while** — the underlying AXe process likely
 crashed. Reload the page; the server will respawn it on the next connect.

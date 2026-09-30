@@ -1,8 +1,11 @@
 // sim-stream: serves an iOS Simulator to a web browser.
 //
-// Two channels to each client:
+// Channels to each client:
 //   - GET /stream  — MJPEG, from `axe stream-video --format mjpeg` (stdout
 //     proxied after stripping AXe's HTTP preamble).
+//   - WS /video    — H.264 at up to 30 fps, when the optional encoder helper
+//     is built: `axe stream-video --format bgra` piped into it, its records
+//     fanned out as binary messages (h264.js). MJPEG stays the fallback.
 //   - WS /ws       — JSON input events (tap/swipe/type/button/key),
 //     dispatched as AXe commands through a FIFO queue.
 //
@@ -17,11 +20,13 @@ import { spawn, execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { getRemoteProvider } from "./remote.js";
 import { ShareRegistry, mintToken, parseShareSpec } from "./shares.js";
+import { H264Hub, parsePngSize, planCapture } from "./h264.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -62,6 +67,11 @@ const HOST = args.host || process.env.HOST || "127.0.0.1";
 const FPS = parseInt(args.fps || "15", 10);
 const QUALITY = parseInt(args.quality || "75", 10);
 const SCALE = parseFloat(args.scale || "0.5");
+// The H.264 path captures at 30 fps unless --fps says otherwise. (MJPEG's
+// default of 15 is already more than AXe's MJPEG mode delivers.)
+const H264_FPS = args.fps !== undefined ? FPS : 30;
+// The optional encoder helper (`npm run build:helper`). Absent → MJPEG only.
+const ENCODER = path.join(__dirname, "helper", ".build", "release", "sim-stream-encoder");
 const REQUIRE_AUTH = args.auth !== "false";
 const REMOTE = getRemoteProvider(args.remote || null);
 
@@ -383,6 +393,148 @@ class MjpegHub extends EventEmitter {
   }
 }
 
+// --- H.264 capture pipeline -----------------------------------------------
+//
+// `axe stream-video --format bgra | sim-stream-encoder`, as two child
+// processes. The hub that owns their lifecycle and fans the encoder's records
+// out to `/video` viewers is in h264.js; this is only the process plumbing.
+
+// Decides once, at startup, whether the H.264 path exists for this run.
+// Returns planCapture()'s result, or { ok: false, reason }. Never throws:
+// every failure just means "MJPEG only".
+async function planH264(udid) {
+  try {
+    fs.accessSync(ENCODER, fs.constants.X_OK);
+  } catch {
+    return { ok: false, reason: "encoder helper not built (npm run build:helper)" };
+  }
+  // The simulator's size in PIXELS, from a screenshot's PNG header. The
+  // bounds table is in points and cannot stand in for it: a wrong size does
+  // not fail, it shears every row of the picture.
+  let dir = null;
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "sim-stream-"));
+    const shot = path.join(dir, "probe.png");
+    await runScreenshot(udid, shot);
+    const head = Buffer.alloc(24);
+    const fd = fs.openSync(shot, "r");
+    try { fs.readSync(fd, head, 0, 24, 0); } finally { fs.closeSync(fd); }
+    const source = parsePngSize(head);
+    if (!source) return { ok: false, reason: "could not read the simulator's pixel size from a screenshot" };
+    return planCapture({ source, scale: SCALE, fps: H264_FPS });
+  } catch (e) {
+    return { ok: false, reason: `could not measure the simulator screen (${e.message})` };
+  } finally {
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Spawns the pipeline for one hub generation. Returns an emitter with "data"
+// (chunks of encoder records), "exit" (once, when both processes are gone)
+// and kill() — the shape H264Hub expects.
+function spawnH264Pipeline(udid, plan) {
+  const axeArgs = [
+    "stream-video",
+    "--udid", udid,
+    "--format", "bgra",
+    "--fps", String(plan.fps),
+    "--scale", String(plan.scale),
+  ];
+  // The helper derives AXe's padded frame layout from --source and --scale,
+  // so it must be told exactly what AXe was told.
+  const encArgs = [
+    "--source", `${plan.source.width}x${plan.source.height}`,
+    "--scale", String(plan.scale),
+    "--fps", String(plan.fps),
+  ];
+  console.log(`[h264] spawn: ${AXE} ${axeArgs.join(" ")} | sim-stream-encoder ${encArgs.join(" ")}`);
+
+  // A spawn that fails for lack of file descriptors comes back without its
+  // stdio streams (and reports through "error"); there is no pipeline to build.
+  const abandon = (procs, message) => {
+    for (const proc of procs) {
+      proc.on("error", () => {});
+      proc.kill("SIGKILL");
+    }
+    throw new Error(message);
+  };
+  const axe = spawn(AXE, axeArgs, { stdio: ["ignore", "pipe", "pipe"] });
+  if (!axe.stdout || !axe.stderr) abandon([axe], "could not spawn axe");
+  // AXe's stdout is handed to the helper as its stdin — a file descriptor, not
+  // a Node stream: the raw frames are ~95 MB/s at the default scale and must
+  // never pass through this process.
+  let enc;
+  try {
+    enc = spawn(ENCODER, encArgs, { stdio: [axe.stdout, "pipe", "pipe"] });
+  } catch (e) {
+    abandon([axe], `could not spawn the encoder (${e.message})`);
+  } finally {
+    // Drop our copy of the read end. While we held it, a dead helper would
+    // leave AXe writing into a pipe nobody reads, instead of getting EPIPE.
+    axe.stdout.destroy();
+  }
+  if (!enc.stdout || !enc.stderr) abandon([axe, enc], "could not spawn the encoder");
+
+  const pipeline = new EventEmitter();
+  const procs = [["axe", axe], ["encoder", enc]];
+  const running = (proc) => proc.exitCode === null && proc.signalCode === null;
+  const ends = [];
+  let alive = procs.length;
+  let killed = false;
+  let killTimer = null;
+
+  pipeline.kill = () => {
+    if (killed) return;
+    killed = true;
+    for (const [, proc] of procs) if (running(proc)) proc.kill("SIGTERM");
+    killTimer = setTimeout(() => {
+      for (const [, proc] of procs) if (running(proc)) proc.kill("SIGKILL");
+    }, 2000);
+    killTimer.unref();
+  };
+
+  for (const [name, proc] of procs) {
+    let done = false;
+    const end = (how) => {
+      if (done) return;
+      done = true;
+      ends.push(`${name} ${how}`);
+      // One half gone means the stream is over; take the other half with it
+      // rather than trusting EOF/EPIPE to get there.
+      pipeline.kill();
+      if (--alive > 0) return;
+      clearTimeout(killTimer);
+      pipeline.emit("exit", ends.join(", "));
+    };
+    proc.on("exit", (code, sig) => end(sig ? `killed by ${sig}` : `exited ${code}`));
+    proc.on("error", (e) => end(`failed (${e.message})`));
+  }
+
+  enc.stdout.on("data", (chunk) => pipeline.emit("data", chunk));
+  enc.stdout.on("error", () => {});
+  // AXe narrates every raw stream on stderr (a banner with an ffmpeg hint,
+  // then progress counters). Only what is not that routine chatter is shown.
+  const chatter = /^(\s*$|Starting BGRA video stream|Format: bgra|Note: This is raw pixel data|\s+axe stream-video |Press Ctrl\+C|BGRA stream |Stopping BGRA stream|Captured \d+ frames|Streamed \d+ frames)/;
+  const relay = (stream, prefix, skip) => {
+    let partial = "";
+    stream.on("data", (d) => {
+      const lines = (partial + d.toString()).split("\n");
+      partial = lines.pop();
+      // A child that never ends its line must not grow this without bound.
+      if (partial.length > 4096) lines.push(partial), partial = "";
+      for (const line of lines) {
+        if (!skip?.test(line)) process.stderr.write(`${prefix} ${line}\n`);
+      }
+    });
+    stream.on("end", () => {
+      if (partial && !skip?.test(partial)) process.stderr.write(`${prefix} ${partial}\n`);
+    });
+  };
+  relay(axe.stderr, "[axe video]", chatter);
+  relay(enc.stderr, "[encoder]");
+  return pipeline;
+}
+
 // --- AXe command queue (input) --------------------------------------------
 
 class CommandQueue {
@@ -557,6 +709,31 @@ async function main() {
   const queue = new CommandQueue(sim.udid);
 
   const bounds = boundsForDeviceType(sim.deviceType);
+
+  // The H.264 path is decided once, here: it exists for this run only if the
+  // helper is built and the simulator's pixel size could be measured. Anything
+  // else is MJPEG exactly as before — `videoHub` stays null and `/video`
+  // answers 404.
+  const plan = await planH264(sim.udid);
+  for (const note of plan.notes ?? []) console.log(`[h264] ${note}`);
+  if (plan.ok) console.log(`[h264] encoder helper found — /video serves H.264 ${plan.width}x${plan.height} @${plan.fps}fps`);
+  else console.log(`[h264] off — ${plan.reason}; serving MJPEG only`);
+  // What /api/info and the `hello` frame advertise. width × height is the
+  // decoded picture; it maps onto the whole screen (`bounds`).
+  const h264Info = plan.ok
+    ? { available: true, path: "/video", width: plan.width, height: plan.height, fps: plan.fps }
+    : { available: false, reason: plan.reason };
+  const videoHub = plan.ok
+    ? new H264Hub({
+        spawnPipeline: () => spawnH264Pipeline(sim.udid, plan),
+        info: { width: plan.width, height: plan.height, fps: plan.fps },
+        // A viewer with about two seconds of video still unsent is skipped
+        // forward to the next keyframe instead of being queued for. (Two, not
+        // one: joining replays up to a second of video in one burst.)
+        highWaterBytes: Math.max(512 * 1024, Math.ceil(plan.bitrate / 4)),
+        log: (line) => console.log(`[h264] ${line}`),
+      })
+    : null;
   const app = express();
 
   // Templated HTML: inject the real aspect-ratio into the page so the img tag
@@ -593,7 +770,7 @@ async function main() {
     }
     res.type("html").send(renderedHtml);
   });
-  app.get("/api/info", authCheck, (req, res) => res.json({ simulator: sim, bounds, fps: FPS, quality: QUALITY, scale: SCALE }));
+  app.get("/api/info", authCheck, (req, res) => res.json({ simulator: sim, bounds, fps: FPS, quality: QUALITY, scale: SCALE, h264: h264Info }));
 
   app.get("/stream", authCheck, (req, res) => {
     res.writeHead(200, {
@@ -612,6 +789,9 @@ async function main() {
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true });
+  // `/video` is send-only: viewers have nothing to say, so anything beyond a
+  // control frame's worth of inbound data closes the socket (1009).
+  const videoWss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
 
   const safeSend = (ws, payload) => {
     if (ws.readyState !== ws.OPEN) return;
@@ -621,16 +801,31 @@ async function main() {
     for (const ws of wss.clients) safeSend(ws, payload);
   };
   hub.on("status", (status) => broadcast({ type: "stream", status }));
+  videoHub?.on("status", (status) => broadcast({ type: "h264", status }));
 
+  // Both WebSocket endpoints enter here and pass the same check, in the same
+  // order: path, then credential, then (for /video) whether the path exists.
   server.on("upgrade", (req, socket, head) => {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname !== "/ws") return socket.destroy();
+    let url;
+    try {
+      // A fixed base, never the Host header: only the path and query matter,
+      // and a malformed Host must not be able to throw out of this handler.
+      url = new URL(req.url, "http://x");
+    } catch {
+      return socket.destroy();
+    }
+    const target = url.pathname === "/ws" ? wss : url.pathname === "/video" ? videoWss : null;
+    if (!target) return socket.destroy();
     const share = requestAuthorized(req, url.searchParams.get("token") ?? undefined);
     if (!share) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       return socket.destroy();
     }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req, share));
+    if (target === videoWss && !videoHub) {
+      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+      return socket.destroy();
+    }
+    target.handleUpgrade(req, socket, head, (ws) => target.emit("connection", ws, req, share));
   });
 
   // 1008 (policy violation) is one of the two codes the client reads as "your
@@ -639,8 +834,18 @@ async function main() {
 
   wss.on("connection", (ws, _req, share) => {
     console.log("[ws] connected");
+    // `ws` reports a malformed frame as an "error" event and then closes the
+    // socket itself. Unhandled, that event is an uncaught exception: one bad
+    // frame from any authorized client would take the whole server down.
+    ws.on("error", (e) => console.error(`[ws] protocol error: ${e.message}`));
     ws.on("close", trackSession(share, () => expireSocket(ws)));
-    safeSend(ws, { type: "hello", simulator: sim, bounds, stream: hub.status });
+    safeSend(ws, {
+      type: "hello",
+      simulator: sim,
+      bounds,
+      stream: hub.status,
+      h264: { ...h264Info, status: videoHub?.status ?? "idle" },
+    });
     ws.on("message", async (raw) => {
       // Checked per message, not just by the expiry sweep: close() only starts
       // a handshake, and a client that never answers it keeps the socket
@@ -661,6 +866,30 @@ async function main() {
       }
     });
     ws.on("close", () => console.log("[ws] disconnected"));
+  });
+
+  // H.264 viewers. The socket carries video one way; the hub decides what each
+  // viewer is sent (h264.js). Like /stream and /ws, the connection is
+  // authorized once, at the upgrade, so it is tracked against its share.
+  videoWss.on("connection", (ws, _req, share) => {
+    console.log("[video] connected");
+    let leave = () => {};
+    let expired = false;
+    // Must have a listener (see /ws above); "close" follows and does the rest.
+    ws.on("error", (e) => console.error(`[video] protocol error: ${e.message}`));
+    ws.on("close", trackSession(share, () => {
+      // Out of the hub first: close() only starts a handshake, and not one
+      // more frame may go to a viewer whose share is dead.
+      expired = true;
+      leave();
+      expireSocket(ws);
+    }));
+    ws.on("close", () => {
+      leave();
+      console.log("[video] disconnected");
+    });
+    if (expired) return; // the share died between the upgrade check and here
+    leave = videoHub.addViewer(ws);
   });
 
   // Provider may advise a bind host (e.g. lan -> 0.0.0.0, tailscale-* -> 127.0.0.1).
@@ -713,6 +942,9 @@ async function main() {
   }
   console.log(`  simulator: ${sim.name} (${sim.udid})`);
   console.log(`  stream:    ${FPS}fps scale=${SCALE} quality=${QUALITY}`);
+  console.log(plan.ok
+    ? `  video:     H.264 ${plan.width}x${plan.height} @${plan.fps}fps on /video (MJPEG on /stream)`
+    : `  video:     MJPEG only — ${plan.reason}`);
   console.log("");
 
   let shuttingDown = false;
@@ -721,6 +953,7 @@ async function main() {
     shuttingDown = true;
     console.log("\n[shutdown] cleaning up...");
     hub.stop();
+    videoHub?.stop();
     SHARES?.stop();
     if (REMOTE?.stop) {
       try { await REMOTE.stop(); } catch {}
